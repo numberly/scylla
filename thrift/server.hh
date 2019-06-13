@@ -36,9 +36,10 @@ class thrift_stats;
 class database;
 
 #ifdef THRIFT_USES_BOOST
-namespace thrift_std = boost;
+#include <boost/make_shared.hpp>
+namespace thrift_boost = boost;
 #else
-namespace thrift_std = std;
+namespace thrift_boost = std;
 #endif
 
 namespace cassandra {
@@ -86,12 +87,12 @@ class thrift_server {
         input_stream<char> _read_buf;
         output_stream<char> _write_buf;
         temporary_buffer<char> _in_tmp;
-        thrift_std::shared_ptr<fake_transport> _transport;
-        thrift_std::shared_ptr<apache::thrift::transport::TMemoryBuffer> _input;
-        thrift_std::shared_ptr<apache::thrift::transport::TMemoryBuffer> _output;
-        thrift_std::shared_ptr<apache::thrift::protocol::TProtocol> _in_proto;
-        thrift_std::shared_ptr<apache::thrift::protocol::TProtocol> _out_proto;
-        thrift_std::shared_ptr<apache::thrift::async::TAsyncProcessor> _processor;
+        thrift_boost::shared_ptr<fake_transport> _transport;
+        thrift_boost::shared_ptr<apache::thrift::transport::TMemoryBuffer> _input;
+        thrift_boost::shared_ptr<apache::thrift::transport::TMemoryBuffer> _output;
+        thrift_boost::shared_ptr<apache::thrift::protocol::TProtocol> _in_proto;
+        thrift_boost::shared_ptr<apache::thrift::protocol::TProtocol> _out_proto;
+        thrift_boost::shared_ptr<apache::thrift::async::TAsyncProcessor> _processor;
         promise<> _processor_promise;
     public:
         connection(thrift_server& server, connected_socket&& fd, socket_address addr);
@@ -107,9 +108,9 @@ class thrift_server {
 private:
     std::vector<server_socket> _listeners;
     std::unique_ptr<thrift_stats> _stats;
-    thrift_std::shared_ptr<::cassandra::CassandraCobSvIfFactory> _handler_factory;
+    thrift_boost::shared_ptr<::cassandra::CassandraCobSvIfFactory> _handler_factory;
     std::unique_ptr<apache::thrift::protocol::TProtocolFactory> _protocol_factory;
-    thrift_std::shared_ptr<apache::thrift::async::TAsyncProcessorFactory> _processor_factory;
+    thrift_boost::shared_ptr<apache::thrift::async::TAsyncProcessorFactory> _processor_factory;
     uint64_t _total_connections = 0;
     uint64_t _current_connections = 0;
     uint64_t _requests_served = 0;

@@ -42,14 +42,6 @@
 #include <cctype>
 #include <vector>
 
-#ifdef THRIFT_USES_BOOST
-#include <boost/make_shared.hpp>
-namespace thrift_std = boost;
-#else
-#include <memory>
-namespace thrift_std = std;
-#endif
-
 static logging::logger tlogger("thrift");
 
 using namespace apache::thrift;
@@ -104,9 +96,9 @@ struct thrift_server::connection::fake_transport : TTransport {
 thrift_server::connection::connection(thrift_server& server, connected_socket&& fd, socket_address addr)
         : _server(server), _fd(std::move(fd)), _read_buf(_fd.input())
         , _write_buf(_fd.output())
-        , _transport(thrift_std::make_shared<thrift_server::connection::fake_transport>(this))
-        , _input(thrift_std::make_shared<TMemoryBuffer>())
-        , _output(thrift_std::make_shared<TMemoryBuffer>())
+        , _transport(thrift_boost::make_shared<thrift_server::connection::fake_transport>(this))
+        , _input(thrift_boost::make_shared<TMemoryBuffer>())
+        , _output(thrift_boost::make_shared<TMemoryBuffer>())
         , _in_proto(_server._protocol_factory->getProtocol(_input))
         , _out_proto(_server._protocol_factory->getProtocol(_output))
         , _processor(_server._processor_factory->getProcessor({ _in_proto, _out_proto, _transport })) {
