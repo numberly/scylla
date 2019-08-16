@@ -54,6 +54,7 @@
 #include "tests/make_random_string.hh"
 #include "tests/normalizing_reader.hh"
 #include "sstable_run_based_compaction_strategy_for_tests.hh"
+#include "compatible_ring_position.hh"
 
 #include <stdio.h>
 #include <ftw.h>
@@ -3637,9 +3638,9 @@ SEASTAR_TEST_CASE(test_partition_skipping) {
 
 // Must be run in a seastar thread
 static
-shared_sstable make_sstable_easy(test_env& env, const fs::path& path, flat_mutation_reader rd, sstable_writer_config cfg, const sstables::sstable::version_types version) {
+shared_sstable make_sstable_easy(test_env& env, const fs::path& path, flat_mutation_reader rd, sstable_writer_config cfg, const sstables::sstable::version_types version, int64_t generation = 1) {
     auto s = rd.schema();
-    auto sst = env.make_sstable(s, path.string(), 1, version, big);
+    auto sst = env.make_sstable(s, path.string(), generation, version, big);
     sst->write_components(std::move(rd), 1, s, cfg, encoding_stats{}).get();
     sst->load().get();
     return sst;
@@ -3959,6 +3960,24 @@ SEASTAR_TEST_CASE(sstable_set_erase) {
         set.erase(leveled_sst);
         BOOST_REQUIRE(set.all()->size() == 1);
         BOOST_REQUIRE(set.all()->count(sst));
+    }
+
+    {
+        auto cs = sstables::make_compaction_strategy(sstables::compaction_strategy_type::leveled, s->compaction_strategy_options());
+        sstable_set set = cs.make_sstable_set(s);
+
+        // triggers use-after-free, described in #4572, by operating on interval that relies on info of a destroyed sstable object.
+        {
+            auto sst = sstable_for_overlapping_test(env, s, 0, key_and_token_pair[0].first, key_and_token_pair[0].first, 1);
+            set.insert(sst);
+            BOOST_REQUIRE(set.all()->size() == 1);
+        }
+
+        auto sst2 = sstable_for_overlapping_test(env, s, 0, key_and_token_pair[0].first, key_and_token_pair[0].first, 1);
+        set.insert(sst2);
+        BOOST_REQUIRE(set.all()->size() == 2);
+
+        set.erase(sst2);
     }
 
     {
@@ -4592,6 +4611,7 @@ SEASTAR_TEST_CASE(sstable_cleanup_correctness_test) {
                 mutations.push_back(make_insert(partition_key::from_deeply_exploded(*s, { local_keys.at(i) })));
             }
             auto sst = make_sstable_containing(sst_gen, mutations);
+            auto run_identifier = sst->run_identifier();
 
             auto cf = make_lw_shared<column_family>(s, column_family_test_config(), column_family::no_commitlog(),
                 db.get_compaction_manager(), cl_stats, db.row_cache_tracker());
@@ -4599,9 +4619,13 @@ SEASTAR_TEST_CASE(sstable_cleanup_correctness_test) {
             cf->start();
 
             auto cleanup_compaction = true;
-            auto ret = sstables::compact_sstables(sstables::compaction_descriptor({std::move(sst)}), *cf, sst_gen, sstables::replacer_fn_no_op(), cleanup_compaction).get0();
+            auto descriptor = sstables::compaction_descriptor({std::move(sst)}, compaction_descriptor::default_level,
+                compaction_descriptor::default_max_sstable_bytes, run_identifier);
+            auto ret = sstables::compact_sstables(std::move(descriptor), *cf, sst_gen, sstables::replacer_fn_no_op(), cleanup_compaction).get0();
 
             BOOST_REQUIRE(ret.total_keys_written == total_partitions);
+            BOOST_REQUIRE(ret.new_sstables.size() == 1);
+            BOOST_REQUIRE(ret.new_sstables.front()->run_identifier() == run_identifier);
         });
     });
 }
@@ -4972,5 +4996,112 @@ SEASTAR_TEST_CASE(backlog_tracker_correctness_after_stop_tracking_compaction) {
         // triggers code that iterates through registered compactions.
         cf._data->cm.backlog();
         cf->get_compaction_strategy().get_backlog_tracker().backlog();
+    });
+}
+
+static dht::token token_from_long(int64_t value) {
+    auto t = net::hton(value);
+    bytes b(bytes::initialized_later(), 8);
+    std::copy_n(reinterpret_cast<int8_t*>(&t), 8, b.begin());
+    return { dht::token::kind::key, std::move(b) };
+}
+
+SEASTAR_TEST_CASE(basic_interval_map_testing_for_sstable_set) {
+    using value_set = std::unordered_set<int64_t>;
+    using interval_map_type = boost::icl::interval_map<compatible_ring_position, value_set>;
+    using interval_type = interval_map_type::interval_type;
+
+    interval_map_type map;
+
+        auto builder = schema_builder("tests", "test")
+                .with_column("id", utf8_type, column_kind::partition_key)
+                .with_column("value", int32_type);
+        auto s = builder.build();
+
+    auto make_pos = [&] (int64_t token) -> compatible_ring_position {
+        return compatible_ring_position(s, dht::ring_position::starting_at(token_from_long(token)));
+    };
+
+    auto add = [&] (int64_t start, int64_t end, int gen) {
+        map.insert({interval_type::closed(make_pos(start), make_pos(end)), value_set({gen})});
+    };
+
+    auto subtract = [&] (int64_t start, int64_t end, int gen) {
+        map.subtract({interval_type::closed(make_pos(start), make_pos(end)), value_set({gen})});
+    };
+
+    add(6052159333454473039, 9223347124876901511, 0);
+    add(957694089857623813, 6052133625299168475, 1);
+    add(-9223359752074096060, -4134836824175349559, 2);
+    add(-4134776408386727187, 957682147550689253, 3);
+    add(6092345676202690928, 9223332435915649914, 4);
+    add(-5395436281861775460, -1589168419922166021, 5);
+    add(-1589165560271708558, 6092259415972553765, 6);
+    add(-9223362900961284625, -5395452288575292639, 7);
+
+    subtract(-9223359752074096060, -4134836824175349559, 2);
+    subtract(-9223362900961284625, -5395452288575292639, 7);
+    subtract(-4134776408386727187, 957682147550689253, 3);
+    subtract(-5395436281861775460, -1589168419922166021, 5);
+    subtract(957694089857623813, 6052133625299168475, 1);
+
+    return make_ready_future<>();
+}
+
+SEASTAR_TEST_CASE(partial_sstable_run_filtered_out_test) {
+    BOOST_REQUIRE(smp::count == 1);
+    return test_env::do_with_async([] (test_env& env) {
+        storage_service_for_tests ssft;
+
+        auto s = schema_builder("tests", "partial_sstable_run_filtered_out_test")
+                .with_column("id", utf8_type, column_kind::partition_key)
+                .with_column("value", int32_type).build();
+
+        auto tmp = tmpdir();
+
+        auto cm = make_lw_shared<compaction_manager>();
+        cm->start();
+
+        column_family::config cfg = column_family_test_config();
+        cfg.datadir = tmp.path().string();
+        cfg.enable_commitlog = false;
+        cfg.enable_incremental_backups = false;
+        auto cl_stats = make_lw_shared<cell_locker_stats>();
+        auto tracker = make_lw_shared<cache_tracker>();
+        auto cf = make_lw_shared<column_family>(s, cfg, column_family::no_commitlog(), *cm, *cl_stats, *tracker);
+        cf->start();
+        cf->mark_ready_for_writes();
+
+        utils::UUID partial_sstable_run_identifier = utils::make_random_uuid();
+        mutation mut(s, partition_key::from_exploded(*s, {to_bytes("alpha")}));
+        mut.set_clustered_cell(clustering_key::make_empty(), bytes("value"), data_value(int32_t(1)), 0);
+
+        sstable_writer_config sst_cfg;
+        sst_cfg.run_identifier = partial_sstable_run_identifier;
+        auto partial_sstable_run_sst = make_sstable_easy(env, tmp.path(), flat_mutation_reader_from_mutations({ std::move(mut) }),
+                                                         sst_cfg, la, 1);
+
+        column_family_test(cf).add_sstable(partial_sstable_run_sst);
+        column_family_test::update_sstables_known_generation(*cf, partial_sstable_run_sst->generation());
+
+        auto generation_exists = [&cf] (int64_t generation) {
+            auto sstables = cf->get_sstables();
+            auto entry = boost::range::find_if(*sstables, [generation] (shared_sstable sst) { return generation == sst->generation(); });
+            return entry != sstables->end();
+        };
+
+        BOOST_REQUIRE(generation_exists(partial_sstable_run_sst->generation()));
+
+        // register partial sstable run
+        auto c_info = make_lw_shared<compaction_info>();
+        c_info->run_identifier = partial_sstable_run_identifier;
+        cm->register_compaction(c_info);
+
+        cf->compact_all_sstables().get();
+
+        // make sure partial sstable run has none of its fragments compacted.
+        BOOST_REQUIRE(generation_exists(partial_sstable_run_sst->generation()));
+
+        cm->stop().get();
     });
 }

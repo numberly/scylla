@@ -91,6 +91,7 @@
 #include "cache_temperature.hh"
 #include <unordered_set>
 #include "disk-error-handler.hh"
+#include "utils/updateable_value.hh"
 
 class cell_locker;
 class cell_locker_stats;
@@ -285,6 +286,7 @@ using sstable_list = sstables::sstable_list;
 struct cf_stats {
     int64_t pending_memtables_flushes_count = 0;
     int64_t pending_memtables_flushes_bytes = 0;
+    int64_t failed_memtables_flushes_count = 0;
 
     // number of time the clustering filter was executed
     int64_t clustering_filter_count = 0;
@@ -323,7 +325,7 @@ public:
         bool enable_cache = true;
         bool enable_commitlog = true;
         bool enable_incremental_backups = false;
-        bool compaction_enforce_min_threshold = false;
+        utils::updateable_value<bool> compaction_enforce_min_threshold{false};
         bool enable_dangerous_direct_import_of_cassandra_counters = false;
         ::dirty_memory_manager* dirty_memory_manager = &default_dirty_memory_manager;
         ::dirty_memory_manager* streaming_dirty_memory_manager = &default_dirty_memory_manager;
@@ -458,6 +460,7 @@ private:
     // This semaphore ensures that an operation like snapshot won't have its selected
     // sstables deleted by compaction in parallel, a race condition which could
     // easily result in failure.
+    // Locking order: must be acquired either independently or after _sstables_lock
     seastar::semaphore _sstable_deletion_sem = {1};
     // There are situations in which we need to stop writing sstables. Flushers will take
     // the read lock, and the ones that wish to stop that process will take the write lock.
@@ -679,7 +682,12 @@ public:
 
     // Single range overload.
     flat_mutation_reader make_streaming_reader(schema_ptr schema, const dht::partition_range& range,
+            const query::partition_slice& slice,
             mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::no) const;
+
+    flat_mutation_reader make_streaming_reader(schema_ptr schema, const dht::partition_range& range) {
+        return make_streaming_reader(schema, range, schema->full_slice());
+    }
 
     sstables::shared_sstable make_streaming_sstable_for_write(std::optional<sstring> subdir = {});
     sstables::shared_sstable make_streaming_staging_sstable() {
@@ -759,13 +767,7 @@ public:
 
     // SSTable writes are now allowed again, and generation is updated to new_generation if != -1
     // returns the amount of microseconds elapsed since we disabled writes.
-    std::chrono::steady_clock::duration enable_sstable_write(int64_t new_generation) {
-        if (new_generation != -1) {
-            update_sstables_known_generation(new_generation);
-        }
-        _sstables_lock.write_unlock();
-        return std::chrono::steady_clock::now() - _sstable_writes_disabled_at;
-    }
+    std::chrono::steady_clock::duration enable_sstable_write(int64_t new_generation);
 
     // Make sure the generation numbers are sequential, starting from "start".
     // Generations before "start" are left untouched.
@@ -1099,7 +1101,7 @@ public:
         bool enable_disk_writes = true;
         bool enable_cache = true;
         bool enable_incremental_backups = false;
-        bool compaction_enforce_min_threshold = false;
+        utils::updateable_value<bool> compaction_enforce_min_threshold{false};
         bool enable_dangerous_direct_import_of_cassandra_counters = false;
         ::dirty_memory_manager* dirty_memory_manager = &default_dirty_memory_manager;
         ::dirty_memory_manager* streaming_dirty_memory_manager = &default_dirty_memory_manager;
@@ -1233,7 +1235,7 @@ private:
     lw_shared_ptr<db_stats> _stats;
     std::unique_ptr<cell_locker_stats> _cl_stats;
 
-    std::unique_ptr<db::config> _cfg;
+    const db::config& _cfg;
 
     dirty_memory_manager _system_dirty_memory_manager;
     dirty_memory_manager _dirty_memory_manager;
@@ -1296,6 +1298,8 @@ private:
     friend db::data_listeners;
     std::unique_ptr<db::data_listeners> _data_listeners;
 
+    bool _supports_infinite_bound_range_deletions = false;
+
     future<> init_commitlog();
     future<> apply_in_memory(const frozen_mutation& m, schema_ptr m_schema, db::rp_handle&&, db::timeout_clock::time_point timeout);
     future<> apply_in_memory(const mutation& m, column_family& cf, db::rp_handle&&, db::timeout_clock::time_point timeout);
@@ -1327,7 +1331,6 @@ public:
     void set_enable_incremental_backups(bool val) { _enable_incremental_backups = val; }
 
     future<> parse_system_tables(distributed<service::storage_proxy>&);
-    database();
     database(const db::config&, database_config dbcfg);
     database(database&&) = delete;
     ~database();
@@ -1436,7 +1439,7 @@ public:
     }
 
     const db::config& get_config() const {
-        return *_cfg;
+        return _cfg;
     }
     const db::extensions& extensions() const;
 
@@ -1509,6 +1512,14 @@ public:
 
     db::data_listeners& data_listeners() const {
         return *_data_listeners;
+    }
+
+    void enable_infinite_bound_range_deletions() {
+        _supports_infinite_bound_range_deletions = true;
+    }
+
+    bool supports_infinite_bound_range_deletions() {
+        return _supports_infinite_bound_range_deletions;
     }
 };
 

@@ -205,6 +205,54 @@ public:
     }
 };
 
+// The repair_tracker tracks ongoing repair operations and their progress.
+// A repair which has already finished successfully is dropped from this
+// table, but a failed repair will remain in the table forever so it can
+// be queried about more than once (FIXME: reconsider this. But note that
+// failed repairs should be rare anwyay).
+// This object is not thread safe, and must be used by only one cpu.
+class tracker {
+private:
+    // Each repair_start() call returns a unique int which the user can later
+    // use to follow the status of this repair with repair_status().
+    // We can't use the number 0 - if repair_start() returns 0, it means it
+    // decide quickly that there is nothing to repair.
+    int _next_repair_command = 1;
+    // Note that there are no "SUCCESSFUL" entries in the "status" map:
+    // Successfully-finished repairs are those with id < _next_repair_command
+    // but aren't listed as running or failed the status map.
+    std::unordered_map<int, repair_status> _status;
+    // Used to allow shutting down repairs in progress, and waiting for them.
+    seastar::gate _gate;
+    // Set when the repair service is being shutdown
+    std::atomic_bool _shutdown alignas(seastar::cache_line_size);
+    // Map repair id into repair_info. The vector has smp::count elements, each
+    // element will be accessed by only one shard.
+    std::vector<std::unordered_map<int, lw_shared_ptr<repair_info>>> _repairs;
+    // Each element in the vector is the semaphore used to control the maximum
+    // ranges that can be repaired in parallel. Each element will be accessed
+    // by one shared.
+    std::vector<semaphore> _range_parallelism_semaphores;
+    static const size_t _max_repair_memory_per_range = 32 * 1024 * 1024;
+public:
+    explicit tracker(size_t nr_shards, size_t max_repair_memory);
+    ~tracker();
+    void start(int id);
+    void done(int id, bool succeeded);
+    repair_status get(int id);
+    int next_repair_command();
+    future<> shutdown();
+    void check_in_shutdown();
+    void add_repair_info(int id, lw_shared_ptr<repair_info> ri);
+    void remove_repair_info(int id);
+    lw_shared_ptr<repair_info> get_repair_info(int id);
+    std::vector<int> get_active() const;
+    size_t nr_running_repair_jobs();
+    void abort_all_repairs();
+    semaphore& range_parallelism_semaphore();
+    static size_t max_repair_memory_per_range() { return _max_repair_memory_per_range; }
+};
+
 future<uint64_t> estimate_partitions(seastar::sharded<database>& db, const sstring& keyspace,
         const sstring& cf, const dht::token_range& range);
 
@@ -271,6 +319,13 @@ struct get_sync_boundary_response {
     uint64_t new_rows_nr;
 };
 
+// Return value of the REPAIR_GET_COMBINED_ROW_HASH RPC verb
+struct get_combined_row_hash_response {
+    repair_hash working_row_buf_combined_csum;
+    // The number of rows in the working row buf
+    uint64_t working_row_buf_nr;
+};
+
 struct node_repair_meta_id {
     gms::inet_address ip;
     uint32_t repair_meta_id;
@@ -284,6 +339,9 @@ class partition_key_and_mutation_fragments {
     partition_key _key;
     std::list<frozen_mutation_fragment> _mfs;
 public:
+    partition_key_and_mutation_fragments()
+        : _key(std::vector<bytes>() ) {
+    }
     partition_key_and_mutation_fragments(partition_key key, std::list<frozen_mutation_fragment> mfs)
         : _key(std::move(key))
         , _mfs(std::move(mfs)) {
@@ -295,10 +353,33 @@ public:
     void push_mutation_fragment(frozen_mutation_fragment mf) { _mfs.push_back(std::move(mf)); }
 };
 
+using repair_row_on_wire = partition_key_and_mutation_fragments;
 using repair_rows_on_wire = std::list<partition_key_and_mutation_fragments>;
+
+enum class repair_stream_cmd : uint8_t {
+    error,
+    hash_data,
+    row_data,
+    end_of_current_hash_set,
+    needs_all_rows,
+    end_of_current_rows,
+    get_full_row_hashes,
+    put_rows_done,
+};
+
+struct repair_hash_with_cmd {
+    repair_stream_cmd cmd;
+    repair_hash hash;
+};
+
+struct repair_row_on_wire_with_cmd {
+    repair_stream_cmd cmd;
+    repair_row_on_wire row;
+};
 
 enum class row_level_diff_detect_algorithm : uint8_t {
     send_full_set,
+    send_full_set_rpc_stream,
 };
 
 std::ostream& operator<<(std::ostream& out, row_level_diff_detect_algorithm algo);

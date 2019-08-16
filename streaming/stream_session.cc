@@ -58,13 +58,15 @@
 #include "service/priority_manager.hh"
 #include "query-request.hh"
 #include "schema_registry.hh"
-#include "multishard_writer.hh"
+#include "mutation_writer/multishard_writer.hh"
 #include "sstables/sstables.hh"
 #include "db/system_keyspace.hh"
 #include "db/view/view_update_checks.hh"
 #include <boost/algorithm/cxx11/any_of.hpp>
 #include <boost/range/adaptor/map.hpp>
 #include "../db/view/view_update_generator.hh"
+#include "mutation_source_metadata.hh"
+#include "streaming/stream_mutation_fragments_cmd.hh"
 
 namespace streaming {
 
@@ -160,7 +162,7 @@ void stream_session::init_messaging_service_handler() {
             });
         });
     });
-    ms().register_stream_mutation_fragments([] (const rpc::client_info& cinfo, UUID plan_id, UUID schema_id, UUID cf_id, uint64_t estimated_partitions, rpc::optional<stream_reason> reason_opt, rpc::source<frozen_mutation_fragment> source) {
+    ms().register_stream_mutation_fragments([] (const rpc::client_info& cinfo, UUID plan_id, UUID schema_id, UUID cf_id, uint64_t estimated_partitions, rpc::optional<stream_reason> reason_opt, rpc::source<frozen_mutation_fragment, rpc::optional<stream_mutation_fragments_cmd>> source) {
         auto from = netw::messaging_service::get_source(cinfo);
         auto reason = reason_opt ? *reason_opt: stream_reason::unspecified;
         sslog.trace("Got stream_mutation_fragments from {} reason {}", from, int(reason));
@@ -172,38 +174,73 @@ void stream_session::init_messaging_service_handler() {
         return with_scheduling_group(service::get_local_storage_service().db().local().get_streaming_scheduling_group(), [from, estimated_partitions, plan_id, schema_id, &cf, source, reason] () mutable {
                 return service::get_schema_for_write(schema_id, from).then([from, estimated_partitions, plan_id, schema_id, &cf, source, reason] (schema_ptr s) mutable {
                     auto sink = ms().make_sink_for_stream_mutation_fragments(source);
-                    auto get_next_mutation_fragment = [source, plan_id, from, s] () mutable {
-                        return source().then([plan_id, from, s] (std::optional<std::tuple<frozen_mutation_fragment>> fmf_opt) mutable {
-                            if (fmf_opt) {
-                                frozen_mutation_fragment& fmf = std::get<0>(fmf_opt.value());
+                    struct stream_mutation_fragments_cmd_status {
+                        bool got_cmd = false;
+                        bool got_end_of_stream = false;
+                    };
+                    auto cmd_status = make_lw_shared<stream_mutation_fragments_cmd_status>();
+                    auto get_next_mutation_fragment = [source, plan_id, from, s, cmd_status] () mutable {
+                        return source().then([plan_id, from, s, cmd_status] (std::optional<std::tuple<frozen_mutation_fragment, rpc::optional<stream_mutation_fragments_cmd>>> opt) mutable {
+                            if (opt) {
+                                auto cmd = std::get<1>(*opt);
+                                if (cmd) {
+                                    cmd_status->got_cmd = true;
+                                    switch (*cmd) {
+                                    case stream_mutation_fragments_cmd::mutation_fragment_data:
+                                        break;
+                                    case stream_mutation_fragments_cmd::error:
+                                        return make_exception_future<mutation_fragment_opt>(std::runtime_error("Sender failed"));
+                                    case stream_mutation_fragments_cmd::end_of_stream:
+                                        cmd_status->got_end_of_stream = true;
+                                        return make_ready_future<mutation_fragment_opt>();
+                                    default:
+                                        return make_exception_future<mutation_fragment_opt>(std::runtime_error("Sender sent wrong cmd"));
+                                    }
+                                }
+                                frozen_mutation_fragment& fmf = std::get<0>(*opt);
                                 auto sz = fmf.representation().size();
                                 auto mf = fmf.unfreeze(*s);
                                 streaming::get_local_stream_manager().update_progress(plan_id, from.addr, progress_info::direction::IN, sz);
                                 return make_ready_future<mutation_fragment_opt>(std::move(mf));
                             } else {
+                                // If the sender has sent stream_mutation_fragments_cmd it means it is
+                                // a node that understands the new protocol. It must send end_of_stream
+                                // before close the stream.
+                                if (cmd_status->got_cmd && !cmd_status->got_end_of_stream) {
+                                    return make_exception_future<mutation_fragment_opt>(std::runtime_error("Sender did not sent end_of_stream"));
+                                }
                                 return make_ready_future<mutation_fragment_opt>();
                             }
                         });
                     };
-                    distribute_reader_and_consume_on_shards(s, dht::global_partitioner(),
+                    mutation_writer::distribute_reader_and_consume_on_shards(s, dht::global_partitioner(),
                         make_generating_reader(s, std::move(get_next_mutation_fragment)),
                         [plan_id, estimated_partitions, reason] (flat_mutation_reader reader) {
                             auto& cf = get_local_db().find_column_family(reader.schema());
                             return db::view::check_needs_view_update_path(_sys_dist_ks->local(), cf, reason).then([cf = cf.shared_from_this(), estimated_partitions, reader = std::move(reader)] (bool use_view_update_path) mutable {
-                                sstables::shared_sstable sst = use_view_update_path ? cf->make_streaming_staging_sstable() : cf->make_streaming_sstable_for_write();
-                                schema_ptr s = reader.schema();
-                                auto& pc = service::get_local_streaming_write_priority();
-                                return sst->write_components(std::move(reader), std::max(1ul, estimated_partitions), s,
-                                                             sstables::sstable_writer_config{}, encoding_stats{}, pc).then([sst] {
-                                    return sst->open_data();
-                                }).then([cf, sst] {
-                                    return cf->add_sstable_and_update_cache(sst);
-                                }).then([cf, s, sst, use_view_update_path]() mutable -> future<> {
-                                    if (!use_view_update_path) {
-                                        return make_ready_future<>();
-                                    }
-                                    return _view_update_generator->local().register_staging_sstable(sst, std::move(cf));
+                                //FIXME: for better estimations this should be transmitted from remote
+                                auto metadata = mutation_source_metadata{};
+                                auto& cs = cf->get_compaction_strategy();
+                                const auto adjusted_estimated_partitions = cs.adjust_partition_estimate(metadata, estimated_partitions);
+                                auto consumer = cf->get_compaction_strategy().make_interposer_consumer(metadata,
+                                        [cf = std::move(cf), adjusted_estimated_partitions, use_view_update_path] (flat_mutation_reader reader) {
+                                    sstables::shared_sstable sst = use_view_update_path ? cf->make_streaming_staging_sstable() : cf->make_streaming_sstable_for_write();
+                                    schema_ptr s = reader.schema();
+                                    auto& pc = service::get_local_streaming_write_priority();
+
+                                    return sst->write_components(std::move(reader), std::max(1ul, adjusted_estimated_partitions), s,
+                                                                 sstables::sstable_writer_config{}, encoding_stats{}, pc).then([sst] {
+                                        return sst->open_data();
+                                    }).then([cf, sst] {
+                                        return cf->add_sstable_and_update_cache(sst);
+                                    }).then([cf, s, sst, use_view_update_path]() mutable -> future<> {
+                                        if (!use_view_update_path) {
+                                            return make_ready_future<>();
+                                        }
+                                        return _view_update_generator->local().register_staging_sstable(sst, std::move(cf));
+                                    });
                                 });
+                                return consumer(std::move(reader));
                             });
                         },
                         cf.stream_in_progress()

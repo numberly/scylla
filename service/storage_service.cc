@@ -68,7 +68,6 @@
 #include "db/commitlog/commitlog.hh"
 #include "db/hints/manager.hh"
 #include <seastar/net/tls.hh>
-#include <seastar/net/dns.hh>
 #include "utils/exceptions.hh"
 #include "message/messaging_service.hh"
 #include "supervisor.hh"
@@ -111,6 +110,7 @@ static const sstring CORRECT_STATIC_COMPACT_IN_MC = "CORRECT_STATIC_COMPACT_IN_M
 static const sstring UNBOUNDED_RANGE_TOMBSTONES_FEATURE = "UNBOUNDED_RANGE_TOMBSTONES";
 static const sstring VIEW_VIRTUAL_COLUMNS = "VIEW_VIRTUAL_COLUMNS";
 static const sstring DIGEST_INSENSITIVE_TO_EXPIRY = "DIGEST_INSENSITIVE_TO_EXPIRY";
+static const sstring COMPUTED_COLUMNS_FEATURE = "COMPUTED_COLUMNS";
 
 static const sstring SSTABLE_FORMAT_PARAM_NAME = "sstable_format";
 
@@ -137,12 +137,14 @@ int get_generation_number() {
 }
 
 storage_service::storage_service(distributed<database>& db, gms::gossiper& gossiper, sharded<auth::service>& auth_service, sharded<db::system_distributed_keyspace>& sys_dist_ks,
-        sharded<db::view::view_update_generator>& view_update_generator, gms::feature_service& feature_service, bool for_testing, std::set<sstring> disabled_features)
+        sharded<db::view::view_update_generator>& view_update_generator, gms::feature_service& feature_service, storage_service_config config, bool for_testing, std::set<sstring> disabled_features)
         : _feature_service(feature_service)
         , _db(db)
         , _gossiper(gossiper)
         , _auth_service(auth_service)
         , _disabled_features(std::move(disabled_features))
+        , _service_memory_total(config.available_memory / 10)
+        , _service_memory_limiter(_service_memory_total)
         , _range_tombstones_feature(_feature_service, RANGE_TOMBSTONES_FEATURE)
         , _large_partitions_feature(_feature_service, LARGE_PARTITIONS_FEATURE)
         , _materialized_views_feature(_feature_service, MATERIALIZED_VIEWS_FEATURE)
@@ -164,6 +166,7 @@ storage_service::storage_service(distributed<database>& db, gms::gossiper& gossi
         , _unbounded_range_tombstones_feature(_feature_service, UNBOUNDED_RANGE_TOMBSTONES_FEATURE)
         , _view_virtual_columns(_feature_service, VIEW_VIRTUAL_COLUMNS)
         , _digest_insensitive_to_expiry(_feature_service, DIGEST_INSENSITIVE_TO_EXPIRY)
+        , _computed_columns(_feature_service, COMPUTED_COLUMNS_FEATURE)
         , _la_feature_listener(*this, _feature_listeners_sem, sstables::sstable_version_types::la)
         , _mc_feature_listener(*this, _feature_listeners_sem, sstables::sstable_version_types::mc)
         , _replicate_action([this] { return do_replicate_to_all_cores(); })
@@ -184,6 +187,13 @@ storage_service::storage_service(distributed<database>& db, gms::gossiper& gossi
     } else {
         _sstables_format = sstables::sstable_version_types::mc;
     }
+
+    _unbounded_range_tombstones_feature.when_enabled().then([&db] () mutable {
+        slogger.debug("Enabling infinite bound range deletions");
+        db.invoke_on_all([] (database& local_db) mutable {
+            local_db.enable_infinite_bound_range_deletions();
+        });
+    });
 }
 
 void storage_service::enable_all_features() {
@@ -211,6 +221,7 @@ void storage_service::enable_all_features() {
         std::ref(_unbounded_range_tombstones_feature),
         std::ref(_view_virtual_columns),
         std::ref(_digest_insensitive_to_expiry),
+        std::ref(_computed_columns),
     })
     {
         if (features.count(f.name())) {
@@ -315,6 +326,7 @@ std::set<sstring> storage_service::get_config_supported_features_set() {
         CORRECT_STATIC_COMPACT_IN_MC,
         VIEW_VIRTUAL_COLUMNS,
         DIGEST_INSENSITIVE_TO_EXPIRY,
+        COMPUTED_COLUMNS_FEATURE,
     };
 
     // Do not respect config in the case database is not started
@@ -483,6 +495,14 @@ void storage_service::prepare_to_join(std::vector<inet_address> loaded_endpoints
         }
     }
 
+    // If this is a restarting node, we should update tokens before gossip starts
+    auto my_tokens = db::system_keyspace::get_saved_tokens().get0();
+    bool restarting_normal_node = db::system_keyspace::bootstrap_complete() && !db().local().is_replacing() && !my_tokens.empty();
+    if (restarting_normal_node) {
+        slogger.info("Restarting a node in NORMAL status");
+        _token_metadata.update_normal_tokens(my_tokens, get_broadcast_address());
+    }
+
     // have to start the gossip service before we can see any info on other nodes.  this is necessary
     // for bootstrap to get the load info it needs.
     // (we won't be part of the storage ring though until we add a counterId to our state, below.)
@@ -493,6 +513,12 @@ void storage_service::prepare_to_join(std::vector<inet_address> loaded_endpoints
     }).get();
     auto features = get_config_supported_features();
     _token_metadata.update_host_id(local_host_id, get_broadcast_address());
+
+    // Replicate the tokens early because once gossip runs other nodes
+    // might send reads/writes to this node. Replicate it early to make
+    // sure the tokens are valid on all the shards.
+    replicate_to_all_cores().get();
+
     auto broadcast_rpc_address = utils::fb_utilities::get_broadcast_rpc_address();
     auto& proxy = service::get_storage_proxy();
     // Ensure we know our own actual Schema UUID in preparation for updates
@@ -507,6 +533,10 @@ void storage_service::prepare_to_join(std::vector<inet_address> loaded_endpoints
     app_states.emplace(gms::application_state::RPC_READY, value_factory.cql_ready(false));
     app_states.emplace(gms::application_state::VIEW_BACKLOG, versioned_value(""));
     app_states.emplace(gms::application_state::SCHEMA, value_factory.schema(schema_version));
+    if (restarting_normal_node) {
+        app_states.emplace(gms::application_state::TOKENS, value_factory.tokens(my_tokens));
+        app_states.emplace(gms::application_state::STATUS, value_factory.normal(my_tokens));
+    }
     slogger.info("Starting up server gossip");
 
     _gossiper.register_(this->shared_from_this());
@@ -815,6 +845,7 @@ void storage_service::bootstrap(std::unordered_set<token> tokens) {
     } else {
         // Dont set any state for the node which is bootstrapping the existing token...
         _token_metadata.update_normal_tokens(tokens, get_broadcast_address());
+        replicate_to_all_cores().get();
         auto replace_addr = db().local().get_replace_address();
         if (replace_addr) {
             slogger.debug("Removing replaced endpoint {} from system.peers", *replace_addr);
@@ -1585,6 +1616,7 @@ future<> storage_service::init_server(int delay, bind_messaging_port do_bind) {
             auto tokens = db::system_keyspace::get_saved_tokens().get0();
             if (!tokens.empty()) {
                 _token_metadata.update_normal_tokens(tokens, get_broadcast_address());
+                replicate_to_all_cores().get();
                 // order is important here, the gossiper can fire in between adding these two states.  It's ok to send TOKENS without STATUS, but *not* vice versa.
                 _gossiper.add_local_application_state({
                     { gms::application_state::TOKENS, value_factory.tokens(tokens) },
@@ -1645,6 +1677,8 @@ future<> storage_service::gossip_snitch_info() {
 future<> storage_service::stop() {
     return with_semaphore(_feature_listeners_sem, 1, [this] {
         uninit_messaging_service();
+    }).then([this] {
+        return _service_memory_limiter.wait(_service_memory_total); // make sure nobody uses the semaphore
     });
 }
 
@@ -1997,6 +2031,20 @@ future<> check_snapshot_not_exist(database& db, sstring ks_name, sstring name) {
     });
 }
 
+template <typename Func>
+std::result_of_t<Func()> storage_service::run_snapshot_modify_operation(Func&& f) {
+    return smp::submit_to(0, [f = std::move(f)] () mutable {
+        return with_lock(get_local_storage_service()._snapshot_lock.for_write(), std::move(f));
+    });
+}
+
+template <typename Func>
+std::result_of_t<Func()> storage_service::run_snapshot_list_operation(Func&& f) {
+    return smp::submit_to(0, [f = std::move(f)] () mutable {
+        return with_lock(get_local_storage_service()._snapshot_lock.for_read(), std::move(f));
+    });
+}
+
 future<> storage_service::take_snapshot(sstring tag, std::vector<sstring> keyspace_names) {
     if (tag.empty()) {
         throw std::runtime_error("You must supply a snapshot name.");
@@ -2006,12 +2054,12 @@ future<> storage_service::take_snapshot(sstring tag, std::vector<sstring> keyspa
         boost::copy(_db.local().get_keyspaces() | boost::adaptors::map_keys, std::back_inserter(keyspace_names));
     };
 
-    return smp::submit_to(0, [] {
+    return run_snapshot_modify_operation([tag = std::move(tag), keyspace_names = std::move(keyspace_names), this] {
         auto mode = get_local_storage_service()._operation_mode;
         if (mode == storage_service::mode::JOINING) {
             throw std::runtime_error("Cannot snapshot until bootstrap completes");
         }
-    }).then([tag = std::move(tag), keyspace_names = std::move(keyspace_names), this] {
+
         return parallel_for_each(keyspace_names, [tag, this] (auto& ks_name) {
             return check_snapshot_not_exist(_db.local(), ks_name, tag);
         }).then([this, tag, keyspace_names] {
@@ -2026,6 +2074,7 @@ future<> storage_service::take_snapshot(sstring tag, std::vector<sstring> keyspa
             });
         });
     });
+
 }
 
 future<> storage_service::take_column_family_snapshot(sstring ks_name, sstring cf_name, sstring tag) {
@@ -2043,12 +2092,11 @@ future<> storage_service::take_column_family_snapshot(sstring ks_name, sstring c
         throw std::runtime_error("You must supply a snapshot name.");
     }
 
-    return smp::submit_to(0, [] {
+    return run_snapshot_modify_operation([this, ks_name = std::move(ks_name), cf_name = std::move(cf_name), tag = std::move(tag)] {
         auto mode = get_local_storage_service()._operation_mode;
         if (mode == storage_service::mode::JOINING) {
             throw std::runtime_error("Cannot snapshot until bootstrap completes");
         }
-    }).then([this, ks_name = std::move(ks_name), cf_name = std::move(cf_name), tag = std::move(tag)] {
         return check_snapshot_not_exist(_db.local(), ks_name, tag).then([this, ks_name, cf_name, tag] {
             return _db.invoke_on_all([ks_name, cf_name, tag] (database &db) {
                 auto& cf = db.find_column_family(ks_name, cf_name);
@@ -2059,7 +2107,9 @@ future<> storage_service::take_column_family_snapshot(sstring ks_name, sstring c
 }
 
 future<> storage_service::clear_snapshot(sstring tag, std::vector<sstring> keyspace_names) {
-    return _db.local().clear_snapshot(tag, keyspace_names);
+    return run_snapshot_modify_operation([this, tag = std::move(tag), keyspace_names = std::move(keyspace_names)] {
+        return _db.local().clear_snapshot(tag, keyspace_names);
+    });
 }
 
 future<std::unordered_map<sstring, std::vector<service::storage_service::snapshot_details>>>
@@ -2095,8 +2145,8 @@ storage_service::get_snapshot_details() {
             return std::move(_result);
         }
     };
-
-    return _db.map_reduce(snapshot_reducer(), [] (database& db) {
+  return run_snapshot_list_operation([] {
+    return get_local_storage_service()._db.map_reduce(snapshot_reducer(), [] (database& db) {
         auto local_snapshots = make_lw_shared<snapshot_map>();
         return parallel_for_each(db.get_column_families(), [local_snapshots] (auto& cf_pair) {
             return cf_pair.second->get_snapshot_details().then([uuid = cf_pair.first, local_snapshots] (auto map) {
@@ -2111,13 +2161,13 @@ storage_service::get_snapshot_details() {
         }).then([local_snapshots] {
             return make_ready_future<snapshot_map>(std::move(*local_snapshots));
         });
-    }).then([this] (snapshot_map&& map) {
+    }).then([] (snapshot_map&& map) {
         std::unordered_map<sstring, std::vector<service::storage_service::snapshot_details>> result;
         for (auto&& pair: map) {
             std::vector<service::storage_service::snapshot_details> details;
 
             for (auto&& snap_map: pair.second) {
-                auto& cf = _db.local().find_column_family(snap_map.first);
+                auto& cf = get_local_storage_service()._db.local().find_column_family(snap_map.first);
                 details.push_back({ snap_map.second.live, snap_map.second.total, cf.schema()->cf_name(), cf.schema()->ks_name() });
             }
             result.emplace(pair.first, std::move(details));
@@ -2125,6 +2175,7 @@ storage_service::get_snapshot_details() {
 
         return make_ready_future<std::unordered_map<sstring, std::vector<service::storage_service::snapshot_details>>>(std::move(result));
     });
+  });
 }
 
 future<int64_t> storage_service::true_snapshots_size() {
@@ -2158,17 +2209,19 @@ future<> storage_service::start_rpc_server() {
         auto& cfg = ss._db.local().get_config();
         auto port = cfg.rpc_port();
         auto addr = cfg.rpc_address();
+        auto preferred = cfg.rpc_interface_prefer_ipv6() ? std::make_optional(net::inet_address::family::INET6) : std::nullopt;
+        auto family = cfg.enable_ipv6_dns_lookup() || preferred ? std::nullopt : std::make_optional(net::inet_address::family::INET);
         auto keepalive = cfg.rpc_keepalive();
         thrift_server_config tsc;
         tsc.timeout_config = make_timeout_config(cfg);
         tsc.max_request_size = cfg.thrift_max_message_length_in_mb() * (uint64_t(1) << 20);
-        return seastar::net::dns::resolve_name(addr).then([&ss, tserver, addr, port, keepalive, tsc] (seastar::net::inet_address ip) {
+        return gms::inet_address::lookup(addr, family, preferred).then([&ss, tserver, addr, port, keepalive, tsc] (gms::inet_address ip) {
             return tserver->start(std::ref(ss._db), std::ref(cql3::get_query_processor()), std::ref(ss._auth_service), tsc).then([tserver, port, addr, ip, keepalive] {
                 // #293 - do not stop anything
                 //engine().at_exit([tserver] {
                 //    return tserver->stop();
                 //});
-                return tserver->invoke_on_all(&thrift_server::listen, ipv4_addr{ip, port}, keepalive);
+                return tserver->invoke_on_all(&thrift_server::listen, socket_address{ip, port}, keepalive);
             });
         }).then([addr, port] {
             slogger.info("Thrift server listening on {}:{} ...", addr, port);
@@ -2210,28 +2263,26 @@ future<> storage_service::start_native_transport() {
 
         auto& cfg = ss._db.local().get_config();
         auto addr = cfg.rpc_address();
+        auto preferred = cfg.rpc_interface_prefer_ipv6() ? std::make_optional(net::inet_address::family::INET6) : std::nullopt;
+        auto family = cfg.enable_ipv6_dns_lookup() || preferred ? std::nullopt : std::make_optional(net::inet_address::family::INET);
         auto ceo = cfg.client_encryption_options();
         auto keepalive = cfg.rpc_keepalive();
         cql_transport::cql_server_config cql_server_config;
         cql_server_config.timeout_config = make_timeout_config(cfg);
-        cql_server_config.max_request_size = ss._db.local().get_available_memory() / 10;
+        cql_server_config.max_request_size = ss._service_memory_total;
+        cql_server_config.get_service_memory_limiter_semaphore = [ss = std::ref(get_storage_service())] () -> semaphore& { return ss.get().local()._service_memory_limiter; };
         cql_server_config.allow_shard_aware_drivers = cfg.enable_shard_aware_drivers();
-        cql_transport::cql_load_balance lb = cql_transport::parse_load_balance(cfg.load_balance());
-        return seastar::net::dns::resolve_name(addr).then([&ss, cserver, addr, &cfg, lb, keepalive, ceo = std::move(ceo), cql_server_config] (seastar::net::inet_address ip) {
-                return cserver->start(std::ref(service::get_storage_proxy()), std::ref(cql3::get_query_processor()), lb, std::ref(ss._auth_service), cql_server_config).then([cserver, &cfg, addr, ip, ceo, keepalive]() {
-                // #293 - do not stop anything
-                //engine().at_exit([cserver] {
-                //    return cserver->stop();
-                //});
+        return gms::inet_address::lookup(addr, family, preferred).then([&ss, cserver, addr, &cfg, keepalive, ceo = std::move(ceo), cql_server_config] (seastar::net::inet_address ip) {
+                return cserver->start(std::ref(service::get_storage_proxy()), std::ref(cql3::get_query_processor()), std::ref(ss._auth_service), cql_server_config).then([cserver, &cfg, addr, ip, ceo, keepalive]() {
 
                 auto f = make_ready_future();
 
                 struct listen_cfg {
-                    ipv4_addr addr;
+                    socket_address addr;
                     std::shared_ptr<seastar::tls::credentials_builder> cred;
                 };
 
-                std::vector<listen_cfg> configs({ { ipv4_addr{ip, cfg.native_transport_port()} }});
+                std::vector<listen_cfg> configs({ { socket_address{ip, cfg.native_transport_port()} }});
 
                 // main should have made sure values are clean and neatish
                 if (ceo.at("enabled") == "true") {
@@ -2256,7 +2307,7 @@ future<> storage_service::start_native_transport() {
                     slogger.info("Enabling encrypted CQL connections between client and server");
 
                     if (cfg.native_transport_port_ssl.is_set() && cfg.native_transport_port_ssl() != cfg.native_transport_port()) {
-                        configs.emplace_back(listen_cfg{ipv4_addr{ip, cfg.native_transport_port_ssl()}, std::move(cred)});
+                        configs.emplace_back(listen_cfg{{ip, cfg.native_transport_port_ssl()}, std::move(cred)});
                     } else {
                         configs.back().cred = std::move(cred);
                     }
@@ -3357,8 +3408,8 @@ storage_service::view_build_statuses(sstring keyspace, sstring view_name) const 
 }
 
 future<> init_storage_service(distributed<database>& db, sharded<gms::gossiper>& gossiper, sharded<auth::service>& auth_service, sharded<db::system_distributed_keyspace>& sys_dist_ks,
-        sharded<db::view::view_update_generator>& view_update_generator, sharded<gms::feature_service>& feature_service) {
-    return service::get_storage_service().start(std::ref(db), std::ref(gossiper), std::ref(auth_service), std::ref(sys_dist_ks), std::ref(view_update_generator), std::ref(feature_service));
+        sharded<db::view::view_update_generator>& view_update_generator, sharded<gms::feature_service>& feature_service, storage_service_config config) {
+    return service::get_storage_service().start(std::ref(db), std::ref(gossiper), std::ref(auth_service), std::ref(sys_dist_ks), std::ref(view_update_generator), std::ref(feature_service), config);
 }
 
 future<> deinit_storage_service() {
@@ -3484,6 +3535,7 @@ db::schema_features storage_service::cluster_schema_features() const {
     db::schema_features f;
     f.set_if<db::schema_feature::VIEW_VIRTUAL_COLUMNS>(bool(_view_virtual_columns));
     f.set_if<db::schema_feature::DIGEST_INSENSITIVE_TO_EXPIRY>(bool(_digest_insensitive_to_expiry));
+    f.set_if<db::schema_feature::COMPUTED_COLUMNS>(bool(_computed_columns));
     return f;
 }
 

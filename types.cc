@@ -52,6 +52,7 @@
 #include "utils/ascii.hh"
 #include "mutation_partition.hh"
 #include "json.hh"
+#include "compaction_garbage_collector.hh"
 
 #include "types/user.hh"
 #include "types/tuple.hh"
@@ -242,11 +243,12 @@ struct integer_type_impl : simple_type_impl<T> {
     virtual bytes from_string(sstring_view s) const override {
         return decompose_value(parse_int(s));
     }
-    virtual sstring to_string(const bytes& b) const override {
+    virtual sstring to_string_impl(const data_value& v) const override {
+        const auto& b = this->from_value(v);
         if (b.empty()) {
             return {};
         }
-        return to_sstring(compose_value(b));
+        return to_sstring(std::move(b).get());
     }
     virtual sstring to_json_string(bytes_view bv) const override {
         return to_sstring(compose_value(bv));
@@ -359,6 +361,9 @@ struct string_type_impl : public concrete_type<sstring> {
     virtual bool is_byte_order_comparable() const override {
         return true;
     }
+    virtual bool is_string() const override {
+        return true;
+    }
     virtual size_t hash(bytes_view v) const override {
         return std::hash<bytes_view>()(v);
     }
@@ -376,11 +381,8 @@ struct string_type_impl : public concrete_type<sstring> {
     virtual bytes from_string(sstring_view s) const override {
         return to_bytes(bytes_view(reinterpret_cast<const int8_t*>(s.begin()), s.size()));
     }
-    virtual sstring to_string(const bytes& b) const override {
-        return sstring(reinterpret_cast<const char*>(b.begin()), b.size());
-    }
-    sstring to_string(bytes_view bv) const {
-        return sstring(reinterpret_cast<const char *>(bv.data()), bv.size());
+    virtual sstring to_string_impl(const data_value& v) const override {
+        return from_value(v);
     }
     virtual sstring to_json_string(bytes_view bv) const override {
         return quote_json_string(to_string(bv));
@@ -454,11 +456,8 @@ struct bytes_type_impl final : public concrete_type<bytes> {
     virtual bytes from_string(sstring_view s) const override {
         return from_hex(s);
     }
-    virtual sstring to_string(const bytes& b) const override {
-        return to_hex(b);
-    }
-    sstring to_string(bytes_view bv) const {
-        return to_hex(bv);
+    virtual sstring to_string_impl(const data_value& v) const override {
+        return to_hex(from_value(v));
     }
     virtual sstring to_json_string(bytes_view bv) const override {
         return quote_json_string("0x" + to_string(bv));
@@ -542,17 +541,12 @@ struct boolean_type_impl : public simple_type_impl<bool> {
             throw marshal_exception(format("unable to make boolean from '{}'", s));
         }
     }
-    virtual sstring to_string(const bytes& b) const override {
-        return to_string(bytes_view(b));
-    }
-    sstring to_string(bytes_view bv) const {
-        if (bv.empty()) {
+    virtual sstring to_string_impl(const data_value& v) const override {
+        const auto& b = this->from_value(v);
+        if (b.empty()) {
             return "";
         }
-        if (bv.size() != 1) {
-            throw marshal_exception(format("Unable to serialize boolean, got {:d} bytes", bv.size()));
-        }
-        return boolean_to_string(bv.front());
+        return boolean_to_string(std::move(b).get());
     }
     virtual sstring to_json_string(bytes_view bv) const override {
         return to_string(bv);
@@ -614,11 +608,7 @@ public:
         return std::hash<bytes_view>()(v);
     }
     virtual bytes from_string(sstring_view s) const override;
-    virtual sstring to_string(const bytes& b) const override {
-        return to_string(bytes_view(b));
-    }
-    sstring to_string(bytes_view bv) const {
-        auto v = deserialize(bv);
+    virtual sstring to_string_impl(const data_value& v) const override {
         if (v.is_null()) {
             return "";
         }
@@ -738,11 +728,7 @@ struct timeuuid_type_impl : public concrete_type<utils::UUID> {
         }
         return v.serialize();
     }
-    virtual sstring to_string(const bytes& b) const override {
-        return to_string(bytes_view(b));
-    }
-    sstring to_string(bytes_view bv) const {
-        auto v = deserialize(bv);
+    virtual sstring to_string_impl(const data_value& v) const override {
         if (v.is_null()) {
             return "";
         }
@@ -899,7 +885,7 @@ public:
                 auto t2 = local_tz::utc_to_local(t - tz_offset);
                 auto dst_offset = t2 - t;
                 t -= tz_offset + dst_offset;
-            } else {
+            } else if (tz != "z") {
                 throw marshal_exception(format("Unable to parse timezone '{}'", tz));
             }
             return (t - boost::posix_time::from_time_t(0)).total_milliseconds();
@@ -918,11 +904,7 @@ public:
         std::copy_n(reinterpret_cast<const int8_t*>(&ts), sizeof(ts), b.begin());
         return b;
     }
-    virtual sstring to_string(const bytes& b) const override {
-        return to_string(bytes_view(b));
-    }
-    sstring to_string(bytes_view bv) const {
-        auto v = deserialize(bv);
+    virtual sstring to_string_impl(const data_value& v) const override {
         if (v.is_null()) {
             return "";
         }
@@ -1041,11 +1023,7 @@ struct simple_date_type_impl : public simple_type_impl<uint32_t> {
         days += 1UL << 31;
         return static_cast<uint32_t>(days);
     }
-    virtual sstring to_string(const bytes& b) const override {
-        return to_string(bytes_view(b));
-    }
-    sstring to_string(bytes_view bv) const {
-        auto v = deserialize(bv);
+    virtual sstring to_string_impl(const data_value& v) const override {
         if (v.is_null()) {
             return "";
         }
@@ -1149,11 +1127,7 @@ struct time_type_impl : public simple_type_impl<int64_t> {
         result += std::chrono::nanoseconds(nanoseconds);
         return result.count();
     }
-    virtual sstring to_string(const bytes& b) const override {
-        return to_string(bytes_view(b));
-    }
-    sstring to_string(bytes_view bv) const {
-         auto v = deserialize(bv);
+    virtual sstring to_string_impl(const data_value& v) const override {
          if (v.is_null()) {
              return "";
          }
@@ -1244,11 +1218,7 @@ struct uuid_type_impl : concrete_type<utils::UUID> {
         utils::UUID v(s);
         return v.serialize();
     }
-    virtual sstring to_string(const bytes& b) const override {
-        return to_string(bytes_view(b));
-    }
-    sstring to_string(bytes_view bv) const {
-        auto v = deserialize(bv);
+    virtual sstring to_string_impl(const data_value& v) const override {
         if (v.is_null()) {
             return "";
         }
@@ -1280,7 +1250,6 @@ struct inet_addr_type_impl : concrete_type<inet_address> {
         if (!value) {
             return;
         }
-        // FIXME: support ipv6
         auto& ipv = from_value(value);
         if (ipv.empty()) {
             return;
@@ -1305,7 +1274,6 @@ struct inet_addr_type_impl : concrete_type<inet_address> {
         if (!value) {
             return 0;
         }
-        // FIXME: support ipv6
         auto& ipv = from_value(value);
         if (ipv.empty()) {
             return 0;
@@ -1359,11 +1327,7 @@ struct inet_addr_type_impl : concrete_type<inet_address> {
         serialize(&ip, out);
         return b;
     }
-    virtual sstring to_string(const bytes& b) const override {
-        return to_string(bytes_view(b));
-    }
-    sstring to_string(bytes_view bv) const {
-        auto v = deserialize(bv);
+    virtual sstring to_string_impl(const data_value& v) const override {
         if (v.is_null()) {
             return "";
         }
@@ -1504,8 +1468,7 @@ struct floating_type_impl : public simple_type_impl<T> {
             throw marshal_exception(format("Invalid number format '{}'", s));
         }
     }
-    virtual sstring to_string(const bytes& b) const override {
-        auto v = deserialize(b);
+    virtual sstring to_string_impl(const data_value& v) const override {
         if (v.is_null()) {
             return "";
         }
@@ -1643,8 +1606,7 @@ public:
         }
         return make_value(negative ? -num : num);
     }
-    virtual sstring to_string(const bytes& b) const override {
-        auto v = deserialize(b);
+    virtual sstring to_string_impl(const data_value& v) const override {
         if (v.is_null()) {
             return "";
         }
@@ -1757,8 +1719,7 @@ public:
         auto real_varint_type = static_cast<const varint_type_impl*>(varint_type.get()); // yuck
         return make_value(big_decimal(scale, real_varint_type->from_value(unscaled).get()));
     }
-    virtual sstring to_string(const bytes& b) const override {
-        auto v = deserialize(b);
+    virtual sstring to_string_impl(const data_value& v) const override {
         if (v.is_null()) {
             return "";
         }
@@ -1824,7 +1785,7 @@ public:
     virtual data_value deserialize(bytes_view v) const override {
         fail(unimplemented::cause::COUNTERS);
     }
-    virtual sstring to_string(const bytes& b) const override {
+    virtual sstring to_string_impl(const data_value& v) const override {
         fail(unimplemented::cause::COUNTERS);
     }
     virtual sstring to_json_string(bytes_view bv) const override {
@@ -1989,11 +1950,7 @@ public:
             throw marshal_exception(e.what());
         }
     }
-    virtual sstring to_string(const bytes& b) const override {
-        return to_string(bytes_view(b));
-    }
-    sstring to_string(bytes_view bv) const {
-        auto v = deserialize(bv);
+    virtual sstring to_string_impl(const data_value& v) const override {
         if (v.is_null()) {
             return "";
         }
@@ -2069,7 +2026,7 @@ struct empty_type_impl : abstract_type {
     virtual data_value deserialize(bytes_view v) const override {
         return data_value::make_null(shared_from_this());
     }
-    virtual sstring to_string(const bytes& b) const override {
+    virtual sstring to_string_impl(const data_value& v) const override {
         return "";
     }
     virtual sstring to_json_string(bytes_view bv) const override {
@@ -2123,8 +2080,7 @@ struct empty_type_impl : abstract_type {
         return false;
     }
     virtual std::optional<data_type> update_user_type(const shared_ptr<const user_type_impl> updated) const {
-        // Can't happen
-        abort();
+        return std::nullopt;
     }
 };
 
@@ -2474,21 +2430,19 @@ void map_type_impl::validate(bytes_view v, cql_serialization_format sf) const {
 }
 
 sstring
-map_type_impl::to_string(const bytes& b) const {
+map_type_impl::to_string_impl(const data_value& v) const {
     bool include_frozen_type = !is_multi_cell();
     std::ostringstream out;
     bool first = true;
-    auto v = bytes_view(b);
-    auto sf = cql_serialization_format::internal();
 
     if (include_frozen_type) {
         out << "(";
     }
 
-    auto size = read_collection_size(v, sf);
-    for (int i = 0; i < size; ++i) {
-        auto kb = read_collection_value(v, sf);
-        auto vb = read_collection_value(v, sf);
+    std::vector<std::pair<data_value, data_value>> m = from_value(v);
+    for (const auto& p : m) {
+        const auto& k = p.first;
+        const auto& v = p.second;
 
         if (first) {
             first = false;
@@ -2496,8 +2450,8 @@ map_type_impl::to_string(const bytes& b) const {
             out << ", ";
         }
 
-        out << "{" << _keys->to_string(bytes(kb.begin(), kb.end())) << " : ";
-        out << _values->to_string(bytes(vb.begin(), vb.end())) << "}";
+        out << "{" << _keys->to_string_impl(k) << " : ";
+        out << _values->to_string_impl(v) << "}";
     }
 
     if (include_frozen_type) {
@@ -2750,38 +2704,51 @@ do_serialize_mutation_form(
     return collection_mutation(ctype, ret);
 }
 
-bool collection_type_impl::mutation::compact_and_expire(row_tombstone base_tomb, gc_clock::time_point query_time,
-    can_gc_fn& can_gc, gc_clock::time_point gc_before)
+bool collection_type_impl::mutation::compact_and_expire(column_id id, row_tombstone base_tomb, gc_clock::time_point query_time,
+    can_gc_fn& can_gc, gc_clock::time_point gc_before, compaction_garbage_collector* collector)
 {
     bool any_live = false;
     auto t = tomb;
-    if (tomb <= base_tomb.regular() || (tomb.deletion_time < gc_before && can_gc(tomb))) {
+    tombstone purged_tomb;
+    if (tomb <= base_tomb.regular()) {
+        tomb = tombstone();
+    } else if (tomb.deletion_time < gc_before && can_gc(tomb)) {
+        purged_tomb = tomb;
         tomb = tombstone();
     }
     t.apply(base_tomb.regular());
-    std::vector<std::pair<bytes, atomic_cell>> survivors;
+    utils::chunked_vector<std::pair<bytes, atomic_cell>> survivors;
+    utils::chunked_vector<std::pair<bytes, atomic_cell>> losers;
     for (auto&& name_and_cell : cells) {
         atomic_cell& cell = name_and_cell.second;
         auto cannot_erase_cell = [&] {
             return cell.deletion_time() >= gc_before || !can_gc(tombstone(cell.timestamp(), cell.deletion_time()));
         };
 
-        if (cell.is_covered_by(t, false)) {
+        if (cell.is_covered_by(t, false) || cell.is_covered_by(base_tomb.shadowable().tomb(), false)) {
             continue;
         }
         if (cell.has_expired(query_time)) {
             if (cannot_erase_cell()) {
                 survivors.emplace_back(std::make_pair(
                     std::move(name_and_cell.first), atomic_cell::make_dead(cell.timestamp(), cell.deletion_time())));
+            } else if (collector) {
+                losers.emplace_back(std::pair(
+                        std::move(name_and_cell.first), atomic_cell::make_dead(cell.timestamp(), cell.deletion_time())));
             }
         } else if (!cell.is_live()) {
             if (cannot_erase_cell()) {
                 survivors.emplace_back(std::move(name_and_cell));
+            } else if (collector) {
+                losers.emplace_back(std::move(name_and_cell));
             }
-        } else if (!cell.is_covered_by(base_tomb.shadowable().tomb(), false)) {
+        } else {
             any_live |= true;
             survivors.emplace_back(std::move(name_and_cell));
         }
+    }
+    if (collector) {
+        collector->collect(id, mutation{purged_tomb, std::move(losers)});
     }
     cells = std::move(survivors);
     return any_live;
@@ -2842,7 +2809,7 @@ collection_type_impl::merge(collection_mutation_view a, collection_mutation_view
             compare,
             merge);
     merged.tomb = std::max(aa.tomb, bb.tomb);
-    return serialize_mutation_form(merged);
+    return serialize_mutation_form(std::move(merged));
   });
  });
 }
@@ -2872,7 +2839,7 @@ collection_type_impl::difference(collection_mutation_view a, collection_mutation
     if (aa.tomb > bb.tomb) {
         diff.tomb = aa.tomb;
     }
-    return serialize_mutation_form(diff);
+    return serialize_mutation_form(std::move(diff));
   });
  });
 }
@@ -3008,20 +2975,18 @@ set_type_impl::deserialize(bytes_view in, cql_serialization_format sf) const {
 }
 
 sstring
-set_type_impl::to_string(const bytes& b) const {
-    using llpdi = listlike_partial_deserializing_iterator;
+set_type_impl::to_string_impl(const data_value& v) const {
     std::ostringstream out;
     bool first = true;
-    auto v = bytes_view(b);
-    auto sf = cql_serialization_format::internal();
-    std::for_each(llpdi::begin(v, sf), llpdi::end(v, sf), [&first, &out, this] (bytes_view e) {
+    std::vector<data_value> native = from_value(v);
+    for (const auto& e : native) {
         if (first) {
             first = false;
         } else {
             out << "; ";
         }
-        out << _elements->to_string(bytes(e.begin(), e.end()));
-    });
+        out << _elements->to_string_impl(e);
+    }
     return out.str();
 }
 
@@ -3245,20 +3210,18 @@ list_type_impl::deserialize(bytes_view in, cql_serialization_format sf) const {
 }
 
 sstring
-list_type_impl::to_string(const bytes& b) const {
-    using llpdi = listlike_partial_deserializing_iterator;
+list_type_impl::to_string_impl(const data_value& v) const {
     std::ostringstream out;
     bool first = true;
-    auto v = bytes_view(b);
-    auto sf = cql_serialization_format::internal();
-    std::for_each(llpdi::begin(v, sf), llpdi::end(v, sf), [&first, &out, this] (bytes_view e) {
+    std::vector<data_value> native = from_value(v);
+    for (const auto& e : native) {
         if (first) {
             first = false;
         } else {
             out << ", ";
         }
-        out << _elements->to_string(bytes(e.begin(), e.end()));
-    });
+        out << _elements->to_string_impl(e);
+    }
     return out.str();
 }
 
@@ -3498,12 +3461,12 @@ static std::vector<sstring_view> split_field_strings(sstring_view v) {
 
 // Replace "\:" with ":" and "\@" with "@".
 static std::string unescape(sstring_view s) {
-    static thread_local std::regex escaped_colon_re("\\\\:");
-    static thread_local std::regex escaped_at_re("\\\\@");
-    std::string result(s);
-    result = std::regex_replace(result, escaped_colon_re, ":");
-    result = std::regex_replace(result, escaped_at_re, "@");
-    return result;
+    return std::regex_replace(std::string(s), std::regex("\\\\([@:])"), "$1");
+}
+
+// Replace ":" with "\:" and "@" with "\@".
+static std::string escape(sstring_view s) {
+    return std::regex_replace(std::string(s), std::regex("[@:]"), "\\$0");
 }
 
 // Concat list of bytes into a single bytes.
@@ -3543,8 +3506,29 @@ tuple_type_impl::from_string(sstring_view s) const {
 }
 
 sstring
-tuple_type_impl::to_string(const bytes& b) const {
-    throw std::runtime_error(format("{} not implemented", __PRETTY_FUNCTION__));
+tuple_type_impl::to_string_impl(const data_value& v) const {
+    const auto& b = from_value(v);
+    if (b.empty()) {
+        return "";
+    }
+
+    std::ostringstream out;
+    for (size_t i = 0; i < b.size(); ++i) {
+        if (i > 0) {
+            out << ":";
+        }
+
+        const auto& val = b[i];
+        if (val.is_null()) {
+            out << "@";
+        } else {
+            // We use ':' as delimiter and '@' to represent null, so they need to be escaped in the tuple's fields.
+            auto typ = type(i);
+            out << escape(typ->to_string(typ->decompose(val)));
+        }
+    }
+
+    return out.str();
 }
 
 sstring tuple_type_impl::to_json_string(bytes_view bv) const {
@@ -3922,6 +3906,9 @@ data_value::data_value(sstring v) : data_value(make_new(utf8_type, v)) {
 data_value::data_value(const char* v) : data_value(make_new(utf8_type, sstring(v))) {
 }
 
+data_value::data_value(ascii_native_type v) : data_value(make_new(ascii_type, v.string)) {
+}
+
 data_value::data_value(bool v) : data_value(make_new(boolean_type, v)) {
 }
 
@@ -3950,6 +3937,8 @@ data_value::data_value(seastar::net::inet_address v) : data_value(make_new(inet_
 }
 
 data_value::data_value(seastar::net::ipv4_address v) : data_value(seastar::net::inet_address(v)) {
+}
+data_value::data_value(seastar::net::ipv6_address v) : data_value(seastar::net::inet_address(v)) {
 }
 
 data_value::data_value(simple_date_native_type v) : data_value(make_new(simple_date_type, v.days)) {
@@ -4014,10 +4003,7 @@ std::ostream& operator<<(std::ostream& out, const data_value& v) {
     if (v.is_null()) {
         return out << "null";
     }
-    bytes b(bytes::initialized_later(), v.serialized_size());
-    auto i = b.begin();
-    v.serialize(i);
-    return out << v.type()->to_string(b);
+    return out << v.type()->to_string_impl(v);
 }
 
 /*

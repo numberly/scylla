@@ -536,7 +536,7 @@ class regular_compaction : public compaction {
     std::optional<compaction_weight_registration> _weight_registration;
     mutable compaction_read_monitor_generator _monitor_generator;
     std::deque<compaction_write_monitor> _active_write_monitors = {};
-    utils::UUID _run_identifier = utils::make_random_uuid();
+    utils::UUID _run_identifier;
 public:
     regular_compaction(column_family& cf, compaction_descriptor descriptor, std::function<shared_sstable()> creator, replacer_fn replacer)
         : compaction(cf, std::move(descriptor.sstables), descriptor.max_sstable_bytes, descriptor.level)
@@ -547,6 +547,7 @@ public:
         , _selector(_set.make_incremental_selector())
         , _weight_registration(std::move(descriptor.weight_registration))
         , _monitor_generator(_cf.get_compaction_manager(), _cf)
+        , _run_identifier(descriptor.run_identifier)
     {
         _info->run_identifier = _run_identifier;
     }
@@ -868,7 +869,7 @@ future<compaction_info> compaction::run(std::unique_ptr<compaction> c) {
 
         auto cr = c->get_compacting_sstable_writer();
         auto cfc = make_stable_flattened_mutations_consumer<compact_for_compaction<compacting_sstable_writer>>(
-            *c->schema(), gc_clock::now(), std::move(cr), c->max_purgeable_func());
+            *c->schema(), gc_clock::now(), c->max_purgeable_func(), std::move(cr));
 
         auto start_time = db_clock::now();
         try {

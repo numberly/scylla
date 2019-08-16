@@ -30,6 +30,7 @@
 
 #include "cql3/column_specification.hh"
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/util/backtrace.hh>
 #include "types.hh"
 #include "compound.hh"
 #include "gc_clock.hh"
@@ -38,6 +39,7 @@
 #include "compress.hh"
 #include "compaction_strategy.hh"
 #include "caching_options.hh"
+#include "column_computation.hh"
 
 using column_count_type = uint32_t;
 
@@ -216,6 +218,7 @@ private:
     bool _is_atomic;
     bool _is_counter;
     column_view_virtual _is_view_virtual;
+    column_computation_ptr _computation;
 
     struct thrift_bits {
         thrift_bits()
@@ -231,6 +234,7 @@ public:
     column_definition(bytes name, data_type type, column_kind kind,
         column_id component_index = 0,
         column_view_virtual view_virtual = column_view_virtual::no,
+        column_computation_ptr = nullptr,
         api::timestamp_type dropped_at = api::missing_timestamp);
 
     data_type type;
@@ -242,6 +246,35 @@ public:
 
     column_kind kind;
     ::shared_ptr<cql3::column_specification> column_specification;
+
+    // NOTICE(sarna): This copy constructor is hand-written instead of default,
+    // because it involves deep copying of the computation object.
+    // Computation has a strict ownership policy provided by
+    // unique_ptr, and as such cannot rely on default copying.
+    column_definition(const column_definition& other)
+            : _name(other._name)
+            , _dropped_at(other._dropped_at)
+            , _is_atomic(other._is_atomic)
+            , _is_counter(other._is_counter)
+            , _is_view_virtual(other._is_view_virtual)
+            , _computation(other.get_computation_ptr())
+            , _thrift_bits(other._thrift_bits)
+            , type(other.type)
+            , id(other.id)
+            , kind(other.kind)
+            , column_specification(other.column_specification)
+        {}
+
+    column_definition& operator=(const column_definition& other) {
+        if (this == &other) {
+            return *this;
+        }
+        column_definition tmp(other);
+        *this = std::move(tmp);
+        return *this;
+    }
+
+    column_definition& operator=(column_definition&& other) = default;
 
     bool is_static() const { return kind == column_kind::static_column; }
     bool is_regular() const { return kind == column_kind::regular_column; }
@@ -257,6 +290,14 @@ public:
     // These columns should be hidden from the user's SELECT queries.
     bool is_view_virtual() const { return _is_view_virtual == column_view_virtual::yes; }
     column_view_virtual view_virtual() const { return _is_view_virtual; }
+    // Computed column values are generated from other columns (and possibly other sources) during updates.
+    // Their values are still stored on disk, same as a regular columns.
+    bool is_computed() const { return bool(_computation); }
+    const column_computation& get_computation() const { return *_computation; }
+    column_computation_ptr get_computation_ptr() const {
+        return _computation ? _computation->clone() : nullptr;
+    }
+    void set_computed(column_computation_ptr computation) { _computation = std::move(computation); }
     // Columns hidden from CQL cannot be in any way retrieved by the user,
     // either explicitly or via the '*' operator, or functions, aggregates, etc.
     bool is_hidden_from_cql() const { return is_view_virtual(); }
@@ -848,3 +889,19 @@ public:
 std::ostream& operator<<(std::ostream& os, const view_ptr& view);
 
 utils::UUID generate_legacy_id(const sstring& ks_name, const sstring& cf_name);
+
+
+// Thrown when attempted to access a schema-dependent object using
+// an incompatible version of the schema object.
+class schema_mismatch_error : public std::runtime_error {
+public:
+    schema_mismatch_error(table_schema_version expected, const schema& access);
+};
+
+// Throws schema_mismatch_error when a schema-dependent object of "expected" version
+// cannot be accessed using "access" schema.
+inline void check_schema_version(table_schema_version expected, const schema& access) {
+    if (expected != access.version()) {
+        throw_with_backtrace<schema_mismatch_error>(expected, access);
+    }
+}

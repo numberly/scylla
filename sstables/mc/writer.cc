@@ -29,6 +29,7 @@
 #include "sstables/mc/types.hh"
 #include "db/config.hh"
 #include "atomic_cell.hh"
+#include "utils/exceptions.hh"
 
 #include <functional>
 #include <boost/iterator/iterator_facade.hpp>
@@ -533,7 +534,7 @@ private:
     shard_id _shard; // Specifies which shard the new SStable will belong to.
     bool _compression_enabled = false;
     std::unique_ptr<file_writer> _data_writer;
-    std::optional<file_writer> _index_writer;
+    std::unique_ptr<file_writer> _index_writer;
     bool _tombstone_written = false;
     bool _static_row_written = false;
     // The length of partition header (partition key, partition deletion and static row, if present)
@@ -592,6 +593,10 @@ private:
     bool _write_regular_as_static; // See #4139
 
     void init_file_writers();
+
+    // Returns the closed writer
+    std::unique_ptr<file_writer> close_writer(std::unique_ptr<file_writer>& w);
+
     void close_data_writer();
     void ensure_tombstone_is_written() {
         if (!_tombstone_written) {
@@ -676,7 +681,7 @@ private:
 
     // Writes single atomic cell
     void write_cell(bytes_ostream& writer, const clustering_key_prefix* clustering_key, atomic_cell_view cell, const column_definition& cdef,
-        const row_time_properties& properties, bytes_view cell_path = {});
+        const row_time_properties& properties, std::optional<bytes_view> cell_path = {});
 
     // Writes information about row liveness (formerly 'row marker')
     void write_liveness_info(bytes_ostream& writer, const row_marker& marker);
@@ -836,13 +841,17 @@ void writer::init_file_writers() {
                 &_sst._components->compression,
                 _schema.get_compressor_params()));
     }
-    _index_writer.emplace(std::move(_sst._index_file), options);
+    _index_writer = std::make_unique<file_writer>(std::move(_sst._index_file), options);
+}
+
+std::unique_ptr<file_writer> writer::close_writer(std::unique_ptr<file_writer>& w) {
+    auto writer = std::move(w);
+    writer->close();
+    return writer;
 }
 
 void writer::close_data_writer() {
-    auto writer = std::move(_data_writer);
-    writer->close();
-
+    auto writer = close_writer(_data_writer);
     if (!_compression_enabled) {
         auto chksum_wr = static_cast<crc32_checksummed_file_writer*>(writer.get());
         _sst.write_digest(chksum_wr->full_checksum());
@@ -970,7 +979,7 @@ void writer::consume(tombstone t) {
 }
 
 void writer::write_cell(bytes_ostream& writer, const clustering_key_prefix* clustering_key, atomic_cell_view cell,
-         const column_definition& cdef, const row_time_properties& properties, bytes_view cell_path) {
+         const column_definition& cdef, const row_time_properties& properties, std::optional<bytes_view> cell_path) {
 
     uint64_t current_pos = writer.size();
     bool is_deleted = !cell.is_live();
@@ -1012,9 +1021,9 @@ void writer::write_cell(bytes_ostream& writer, const clustering_key_prefix* clus
         }
     }
 
-    if (!cell_path.empty()) {
-        write_vint(writer, cell_path.size());
-        write(_sst.get_version(), writer, cell_path);
+    if (bool(cell_path)) {
+        write_vint(writer, cell_path->size());
+        write(_sst.get_version(), writer, *cell_path);
     }
 
     if (cdef.is_counter()) {
@@ -1374,10 +1383,15 @@ stop_iteration writer::consume_end_of_partition() {
         _first_key = *_partition_key;
     }
     _last_key = std::move(*_partition_key);
+    _partition_key = std::nullopt;
     return get_data_offset() < _cfg.max_sstable_size ? stop_iteration::no : stop_iteration::yes;
 }
 
 void writer::consume_end_of_stream() {
+    if (_partition_key) {
+        on_internal_error(sstlog, "Mutation stream ends with unclosed partition during write");
+    }
+
     _cfg.monitor->on_data_write_completed();
 
     seal_summary(_sst._components->summary, std::move(_first_key), std::move(_last_key), _index_sampling_state);
@@ -1386,8 +1400,7 @@ void writer::consume_end_of_stream() {
         _sst.get_metadata_collector().add_compression_ratio(_sst._components->compression.compressed_file_length(), _sst._components->compression.uncompressed_file_length());
     }
 
-    _index_writer->close();
-    _index_writer.reset();
+    close_writer(_index_writer);
     _sst.set_first_and_last_keys();
 
     _sst._components->statistics.contents[metadata_type::Serialization] = std::make_unique<serialization_header>(std::move(_sst_schema.header));

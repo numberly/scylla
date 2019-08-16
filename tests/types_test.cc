@@ -253,6 +253,8 @@ void test_timestamp_like_string_conversions(data_type timestamp_type) {
     BOOST_REQUIRE(timestamp_type->equal(timestamp_type->from_string("2015-07-02 23:00-0100"), timestamp_type->decompose(tp)));
     BOOST_REQUIRE(timestamp_type->equal(timestamp_type->from_string("2015-07-03T00:00+0000"), timestamp_type->decompose(tp)));
     BOOST_REQUIRE(timestamp_type->equal(timestamp_type->from_string("2015-07-03T01:00:00+0000"), timestamp_type->decompose(tp + 1h)));
+    BOOST_REQUIRE(timestamp_type->equal(timestamp_type->from_string("2015-07-03t00:00:00z"), timestamp_type->decompose(tp)));
+    BOOST_REQUIRE(timestamp_type->equal(timestamp_type->from_string("2015-07-03T00:00:00Z"), timestamp_type->decompose(tp)));
     BOOST_REQUIRE(timestamp_type->equal(timestamp_type->from_string("2015-07-03T00:00:00.123+0000"), timestamp_type->decompose(tp + 123ms)));
     BOOST_REQUIRE(timestamp_type->equal(timestamp_type->from_string("2015-07-03T12:30:00+1230"), timestamp_type->decompose(tp)));
     BOOST_REQUIRE(timestamp_type->equal(timestamp_type->from_string("2015-07-02T23:00-0100"), timestamp_type->decompose(tp)));
@@ -311,6 +313,7 @@ BOOST_AUTO_TEST_CASE(test_boolean_type_string_conversions) {
 
     BOOST_REQUIRE_EQUAL(boolean_type->to_string(boolean_type->decompose(false)), "false");
     BOOST_REQUIRE_EQUAL(boolean_type->to_string(boolean_type->decompose(true)), "true");
+    BOOST_REQUIRE_EQUAL(boolean_type->to_string(bytes()), "");
 }
 
 template<typename T>
@@ -483,7 +486,7 @@ BOOST_AUTO_TEST_CASE(test_tuple) {
     auto native_to_c = [] (native_type v) {
         return std::make_tuple(extract<int32_t>(v[0]), extract<int64_t>(v[1]), extract<sstring>(v[2]));
     };
-    auto c_to_native = [] (std::tuple<opt<int32_t>, opt<int64_t>, opt<sstring>> v) {
+    auto c_to_native = [] (c_type v) {
         return native_type({std::get<0>(v), std::get<1>(v), std::get<2>(v)});
     };
     auto native_to_bytes = [t] (native_type v) {
@@ -509,6 +512,13 @@ BOOST_AUTO_TEST_CASE(test_tuple) {
     auto b2 = c_to_bytes(v2);
     BOOST_REQUIRE(t->compare(b1, b2) > 0);
     BOOST_REQUIRE(t->compare(b2, b2) == 0);
+
+    auto test_string_conversion = [=] (c_type v, sstring s) {
+        BOOST_REQUIRE_EQUAL(t->to_string(c_to_bytes(v)), s);
+        BOOST_REQUIRE(t->equal(t->from_string(s), c_to_bytes(v)));
+    };
+
+    test_string_conversion({10, {}, "a@@:b:c"}, "10:@:a\\@\\@\\:b\\:c");
 }
 
 void test_validation_fails(const shared_ptr<const abstract_type>& type, bytes_view v)
@@ -773,6 +783,34 @@ struct test_case {
     data_type to;
     data_type from;
 };
+
+BOOST_AUTO_TEST_CASE(test_map_to_string) {
+    auto n = data_value(int32_t(42));
+    auto m = map_type_impl::get_instance(int32_type, int32_type, true);
+    using native_type = std::vector<std::pair<data_value, data_value>>;
+    native_type native{std::pair(n, n), std::pair(n, n)};
+    auto ptr = std::make_unique<native_type>(std::move(native));
+    auto v = data_value::make(m, std::move(ptr));
+    BOOST_REQUIRE_EQUAL(m->to_string(v.serialize()), "{42 : 42}, {42 : 42}");
+}
+
+BOOST_AUTO_TEST_CASE(test_set_to_string) {
+    auto m = set_type_impl::get_instance(int32_type, true);
+    using native_type = std::vector<data_value>;
+    native_type native{data_value(int32_t(41)), data_value(int32_t(42))};
+    auto ptr = std::make_unique<native_type>(std::move(native));
+    auto v = data_value::make(m, std::move(ptr));
+    BOOST_REQUIRE_EQUAL(m->to_string(v.serialize()), "41; 42");
+}
+
+BOOST_AUTO_TEST_CASE(test_list_to_string) {
+    auto m = list_type_impl::get_instance(int32_type, true);
+    using native_type = std::vector<data_value>;
+    native_type native{data_value(int32_t(41)), data_value(int32_t(42))};
+    auto ptr = std::make_unique<native_type>(std::move(native));
+    auto v = data_value::make(m, std::move(ptr));
+    BOOST_REQUIRE_EQUAL(m->to_string(v.serialize()), "41, 42");
+}
 
 BOOST_AUTO_TEST_CASE(test_collection_type_compatibility) {
     auto m__bi = map_type_impl::get_instance(bytes_type, int32_type, true);

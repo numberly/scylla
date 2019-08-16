@@ -431,7 +431,11 @@ class db::commitlog::segment : public enable_shared_from_this<segment>, public c
 
     uint64_t _file_pos = 0;
     uint64_t _flush_pos = 0;
+
     bool _closed = false;
+    // Not the same as _closed since files can be reused
+    bool _closed_file = false;
+
     bool _terminated = false;
 
     using buffer_type = segment_manager::buffer_type;
@@ -497,7 +501,7 @@ public:
         clogger.debug("Created new {} segment {}", active ? "active" : "reserve", *this);
     }
     ~segment() {
-        if (!_closed) {
+        if (!_closed_file) {
             _segment_manager->add_file_to_close(std::move(_file));
         }
         if (is_clean()) {
@@ -571,7 +575,7 @@ public:
                     // and we should have waited out all pending.
                     return me->_pending_ops.close().finally([me] {
                         return me->_file.truncate(me->_flush_pos).then([me] {
-                            return me->_file.close();
+                            return me->_file.close().finally([me] { me->_closed_file = true; });
                         });
                     });
                 });
@@ -1240,22 +1244,13 @@ future<db::commitlog::segment_manager::sseg_ptr> db::commitlog::segment_manager:
     auto fut = do_io_check(commit_error_handler, [=] {
         auto fut = open_file_dma(filename, flags, opt);
         if (cfg.extensions && !cfg.extensions->commitlog_file_extensions().empty()) {
-            fut = fut.then([this, filename, flags](file f) {
-                return do_with(std::move(f), [this, filename, flags](file& f) {
-                    auto ext_range = cfg.extensions->commitlog_file_extensions();
-                    return do_for_each(ext_range.begin(), ext_range.end(), [&f, filename, flags](auto& ext) {
-                        // note: we're potentially wrapping more than once. extension mechanism
-                        // is responsible for order being sane.
-                        return ext->wrap_file(filename, f, flags).then([&f](file of) {
-                            if (of) {
-                                f = std::move(of);
-                            }
-                        });
-                    }).then([&f] {
-                        return f;
-                    });
+            for (auto * ext : cfg.extensions->commitlog_file_extensions()) {
+                fut = fut.then([ext, filename, flags](file f) {
+                   return ext->wrap_file(filename, f, flags).then([f](file nf) mutable {
+                       return nf ? nf : std::move(f);
+                   });
                 });
-            });
+            }
         }
         return fut;
     });
@@ -2042,22 +2037,13 @@ db::commitlog::read_log_file(const sstring& filename, const sstring& pfx, seasta
     auto fut = do_io_check(commit_error_handler, [&] {
         auto fut = open_file_dma(filename, open_flags::ro);
         if (exts && !exts->commitlog_file_extensions().empty()) {
-            fut = fut.then([filename, exts](file f) {
-                return do_with(std::move(f), [filename, exts](file& f) {
-                    auto ext_range = exts->commitlog_file_extensions() | boost::adaptors::reversed;
-                    return do_for_each(ext_range.begin(), ext_range.end(), [&f, filename](auto& ext) {
-                        // note: we're potentially wrapping more than once. extension mechanism
-                        // is responsible for order being sane.
-                        return ext->wrap_file(filename, f, open_flags::ro).then([&f](file of) {
-                            if (of) {
-                                f = std::move(of);
-                            }
-                        });
-                    }).then([&f] {
-                        return make_ready_future<file>(f);
-                    });
+            for (auto * ext : exts->commitlog_file_extensions()) {
+                fut = fut.then([ext, filename](file f) {
+                   return ext->wrap_file(filename, f, open_flags::ro).then([f](file nf) mutable {
+                       return nf ? nf : std::move(f);
+                   });
                 });
-            });
+            }
         }
         return fut;
     });

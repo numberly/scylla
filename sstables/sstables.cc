@@ -2112,11 +2112,15 @@ stop_iteration components_writer::consume_end_of_partition() {
         _first_key = *_partition_key;
     }
     _last_key = std::move(*_partition_key);
+    _partition_key = std::nullopt;
 
     return get_offset() < _max_sstable_size ? stop_iteration::no : stop_iteration::yes;
 }
 
 void components_writer::consume_end_of_stream() {
+    if (_partition_key) {
+        on_internal_error(sstlog, "Mutation stream ends with unclosed partition during write");
+    }
     // what if there is only one partition? what if it is empty?
     seal_summary(_sst._components->summary, std::move(_first_key), std::move(_last_key), _index_sampling_state);
 
@@ -3125,7 +3129,7 @@ sstable::unlink()
     });
 
     name = get_filename();
-    auto update_large_data_fut = get_large_data_handler().maybe_delete_large_data_entries(*get_schema(), std::move(name), data_size())
+    auto update_large_data_fut = get_large_data_handler().maybe_delete_large_data_entries(*get_schema(), name, data_size())
             .then_wrapped([name = std::move(name)] (future<> f) {
         if (f.failed()) {
             // Just log and ignore failures to delete large data entries.

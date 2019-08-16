@@ -75,6 +75,9 @@ public:
 
     future<> submit_migration_task(const gms::inet_address& endpoint);
 
+    // Makes sure that this node knows about all schema changes known by "nodes" that were made prior to this call.
+    future<> sync_schema(const database& db, const std::vector<gms::inet_address>& nodes);
+
     // Fetches schema from remote node and applies it locally.
     // Differs from submit_migration_task() in that all errors are propagated.
     // Coalesces requests.
@@ -121,7 +124,9 @@ public:
 
     future<> announce_keyspace_drop(const sstring& ks_name, bool announce_locally = false);
 
-    future<> announce_column_family_drop(const sstring& ks_name, const sstring& cf_name, bool announce_locally = false);
+    class drop_views_tag;
+    using drop_views = bool_class<drop_views_tag>;
+    future<> announce_column_family_drop(const sstring& ks_name, const sstring& cf_name, bool announce_locally = false, drop_views drop_views = drop_views::no);
 
     future<> announce_type_drop(user_type dropped_type, bool announce_locally = false);
 

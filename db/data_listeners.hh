@@ -24,6 +24,7 @@
 #include <seastar/core/distributed.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/distributed.hh>
+#include <seastar/core/weak_ptr.hh>
 
 #include "schema.hh"
 #include "flat_mutation_reader.hh"
@@ -75,21 +76,21 @@ public:
 };
 
 
-struct toppartitons_item_key {
+struct toppartitions_item_key {
     schema_ptr schema;
     dht::decorated_key key;
 
-    toppartitons_item_key(const schema_ptr& schema, const dht::decorated_key& key) : schema(schema), key(key) {}
-    toppartitons_item_key(const toppartitons_item_key& key) noexcept : schema(key.schema), key(key.key) {}
+    toppartitions_item_key(const schema_ptr& schema, const dht::decorated_key& key) : schema(schema), key(key) {}
+    toppartitions_item_key(const toppartitions_item_key& key) noexcept : schema(key.schema), key(key.key) {}
 
     struct hash {
-        size_t operator()(const toppartitons_item_key& k) const {
+        size_t operator()(const toppartitions_item_key& k) const {
             return std::hash<dht::token>()(k.key.token());
         }
     };
 
     struct comp {
-        bool operator()(const toppartitons_item_key& k1, const toppartitons_item_key& k2) const {
+        bool operator()(const toppartitions_item_key& k1, const toppartitions_item_key& k2) const {
             return k1.schema == k2.schema && k1.key.equal(*k2.schema, k2.key);
         }
     };
@@ -97,7 +98,7 @@ struct toppartitons_item_key {
     explicit operator sstring() const;
 };
 
-class toppartitions_data_listener : public data_listener {
+class toppartitions_data_listener : public data_listener, public weakly_referencable<toppartitions_data_listener> {
     friend class toppartitions_query;
 
     database& _db;
@@ -105,7 +106,7 @@ class toppartitions_data_listener : public data_listener {
     sstring _cf;
 
 public:
-    using top_k = utils::space_saving_top_k<toppartitons_item_key, toppartitons_item_key::hash, toppartitons_item_key::comp>;
+    using top_k = utils::space_saving_top_k<toppartitions_item_key, toppartitions_item_key::hash, toppartitions_item_key::comp>;
 private:
     top_k _top_k_read;
     top_k _top_k_write;

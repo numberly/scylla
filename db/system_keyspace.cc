@@ -1605,7 +1605,7 @@ future<> update_peer_info(gms::inet_address ep, sstring column_name, Value value
 // sets are not needed, since tokens are updated by another method
 template future<> update_peer_info<sstring>(gms::inet_address ep, sstring column_name, sstring);
 template future<> update_peer_info<utils::UUID>(gms::inet_address ep, sstring column_name, utils::UUID);
-template future<> update_peer_info<net::ipv4_address>(gms::inet_address ep, sstring column_name, net::ipv4_address);
+template future<> update_peer_info<net::inet_address>(gms::inet_address ep, sstring column_name, net::inet_address);
 
 future<> update_hints_dropped(gms::inet_address ep, utils::UUID time_period, int value) {
     // with 30 day TTL
@@ -1893,7 +1893,7 @@ query(distributed<service::storage_proxy>& proxy, const sstring& ks_name, const 
     auto cmd = make_lw_shared<query::read_command>(schema->id(), schema->version(),
         std::move(slice), std::numeric_limits<uint32_t>::max());
     return proxy.local().query(schema, cmd, {query::full_partition_range}, db::consistency_level::ONE,
-            {db::no_timeout, nullptr}).then([schema, cmd] (auto&& qr) {
+            {db::no_timeout, empty_service_permit(), nullptr}).then([schema, cmd] (auto&& qr) {
         return make_lw_shared(query::result_set::from_raw_result(schema, cmd->slice, *qr.query_result));
     });
 }
@@ -1909,7 +1909,7 @@ query(distributed<service::storage_proxy>& proxy, const sstring& ks_name, const 
     auto cmd = make_lw_shared<query::read_command>(schema->id(), schema->version(), std::move(slice), query::max_rows);
 
     return proxy.local().query(schema, cmd, {dht::partition_range::make_singular(key)}, db::consistency_level::ONE,
-            {db::no_timeout, nullptr}).then([schema, cmd] (auto&& qr) {
+            {db::no_timeout, empty_service_permit(), nullptr}).then([schema, cmd] (auto&& qr) {
         return make_lw_shared(query::result_set::from_raw_result(schema, cmd->slice, *qr.query_result));
     });
 }

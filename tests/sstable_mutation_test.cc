@@ -394,12 +394,14 @@ SEASTAR_THREAD_TEST_CASE(read_partial_range_2) {
 
 static
 mutation_source make_sstable_mutation_source(sstables::test_env& env, schema_ptr s, sstring dir, std::vector<mutation> mutations,
-        sstable_writer_config cfg, sstables::sstable::version_types version) {
+        sstable_writer_config cfg, sstables::sstable::version_types version, gc_clock::time_point query_time = gc_clock::now()) {
     auto sst = env.make_sstable(s,
         dir,
         1 /* generation */,
         version,
-        sstables::sstable::format_types::big);
+        sstables::sstable::format_types::big,
+        default_sstable_buffer_size,
+        query_time);
 
     auto mt = make_lw_shared<memtable>(s);
 
@@ -417,9 +419,10 @@ mutation_source make_sstable_mutation_source(sstables::test_env& env, schema_ptr
 static
 void test_mutation_source(sstables::test_env& env, sstable_writer_config cfg, sstables::sstable::version_types version) {
     std::vector<tmpdir> dirs;
-    run_mutation_source_tests([&env, &dirs, &cfg, version] (schema_ptr s, const std::vector<mutation>& partitions) -> mutation_source {
+    run_mutation_source_tests([&env, &dirs, &cfg, version] (schema_ptr s, const std::vector<mutation>& partitions,
+                gc_clock::time_point query_time) -> mutation_source {
         dirs.emplace_back();
-        return make_sstable_mutation_source(env, s, dirs.back().path().string(), partitions, cfg, version);
+        return make_sstable_mutation_source(env, s, dirs.back().path().string(), partitions, cfg, version, query_time);
     });
 }
 
@@ -815,6 +818,60 @@ SEASTAR_THREAD_TEST_CASE(tombstone_in_tombstone2) {
             });
         });
     }).get();
+}
+
+// Reproducer for #4783
+static schema_ptr buffer_overflow_schema() {
+    static thread_local auto s = [] {
+        schema_builder builder(make_lw_shared(schema(generate_legacy_id("test_ks", "test_tab"), "test_ks", "test_tab",
+        // partition key
+        {{"pk", int32_type}},
+        // clustering key
+        {{"ck1", int32_type}, {"ck2", int32_type}},
+        // regular columns
+        {{"data", utf8_type}},
+        // static columns
+        {},
+        // regular column name type
+        utf8_type,
+        // comment
+        ""
+       )));
+       return builder.build(schema_builder::compact_storage::no);
+    }();
+    return s;
+}
+SEASTAR_THREAD_TEST_CASE(buffer_overflow) {
+    auto s = buffer_overflow_schema();
+    auto sstp = ka_sst(s, "tests/sstables/buffer_overflow", 5).get0();
+    auto r = sstp->read_rows_flat(s);
+    auto pk1 = partition_key::from_exploded(*s, { int32_type->decompose(4) });
+    auto dk1 = dht::global_partitioner().decorate_key(*s, pk1);
+    auto pk2 = partition_key::from_exploded(*s, { int32_type->decompose(3) });
+    auto dk2 = dht::global_partitioner().decorate_key(*s, pk2);
+    auto ck1 = clustering_key::from_exploded(*s, {int32_type->decompose(2), int32_type->decompose(2)});
+    auto ck2 = clustering_key::from_exploded(*s, {int32_type->decompose(1), int32_type->decompose(2)});
+    tombstone tomb(api::new_timestamp(), gc_clock::now());
+    range_tombstone rt1(clustering_key::from_exploded(*s, {int32_type->decompose(2)}),
+                        clustering_key::from_exploded(*s, {int32_type->decompose(2)}),
+                        tomb);
+    range_tombstone rt2(clustering_key::from_exploded(*s, {int32_type->decompose(1)}),
+                        clustering_key::from_exploded(*s, {int32_type->decompose(1)}),
+                        tomb);
+    r.set_max_buffer_size(std::max(
+                mutation_fragment(partition_start(dk1, tomb)).memory_usage(*s)
+                    + mutation_fragment(range_tombstone(rt1)).memory_usage(*s),
+                mutation_fragment(clustering_row(ck1)).memory_usage(*s)));
+    flat_reader_assertions rd(std::move(r));
+    rd.produces_partition_start(dk1)
+        .produces_range_tombstone(rt1)
+        .produces_row_with_key(ck1)
+        .produces_partition_end()
+        .produces_partition_start(dk2)
+        .produces_range_tombstone(rt2)
+        .produces_row_with_key(ck2)
+        .produces_partition_end()
+        .produces_end_of_stream();
 }
 
 SEASTAR_TEST_CASE(test_non_compound_table_row_is_not_marked_as_static) {
@@ -1518,7 +1575,8 @@ SEASTAR_THREAD_TEST_CASE(test_reading_serialization_header) {
     auto expiry_time = now + ttl;
 
     auto md2 = tests::data_model::mutation_description({ to_bytes("pk2") });
-    md2.add_static_expiring_cell("s1", random_int32_value(), ttl, expiry_time);
+    md2.add_static_cell("s1",
+            tests::data_model::mutation_description::atomic_value(random_int32_value(), tests::data_model::data_timestamp, ttl, expiry_time));
     auto m2 = md2.build(s);
 
     auto mt = make_lw_shared<memtable>(s);

@@ -119,7 +119,7 @@ public:
         bool select_a_collection,
         bool for_view = false,
         bool allow_filtering = false);
-private:
+
     void add_restriction(::shared_ptr<restriction> restriction, bool for_view, bool allow_filtering);
     void add_single_column_restriction(::shared_ptr<single_column_restriction> restriction, bool for_view, bool allow_filtering);
 public:
@@ -407,7 +407,7 @@ public:
     }
 
     bool ck_restrictions_need_filtering() const {
-        return _clustering_columns_restrictions->needs_filtering(*_schema);
+        return _partition_key_restrictions->has_unrestricted_components(*_schema) || _clustering_columns_restrictions->needs_filtering(*_schema);
     }
 
     /**

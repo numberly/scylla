@@ -240,8 +240,7 @@ def find_headers(repodir, excluded_dirs):
 modes = {
     'debug': {
         'cxxflags': '-DDEBUG -DDEBUG_LSA_SANITIZER',
-        # Disable vptr because of https://gcc.gnu.org/bugzilla/show_bug.cgi?id=88684
-        'cxx_ld_flags': '-O0 -fsanitize=address -fsanitize=leak -fsanitize=undefined -fno-sanitize=vptr',
+        'cxx_ld_flags': '',
     },
     'release': {
         'cxxflags': '',
@@ -251,6 +250,10 @@ modes = {
         'cxxflags': '',
         'cxx_ld_flags': '-O1',
     },
+    'sanitize': {
+        'cxxflags': '-DDEBUG -DDEBUG_LSA_SANITIZER',
+        'cxx_ld_flags': '-Os',
+    }
 }
 
 scylla_tests = [
@@ -363,7 +366,7 @@ scylla_tests = [
     'tests/imr_test',
     'tests/partition_data_test',
     'tests/reusable_buffer_test',
-    'tests/multishard_writer_test',
+    'tests/mutation_writer_test',
     'tests/observable_test',
     'tests/transport_test',
     'tests/fragmented_temporary_buffer_test',
@@ -375,6 +378,7 @@ scylla_tests = [
     'tests/small_vector_test',
     'tests/data_listeners_test',
     'tests/truncation_migration_test',
+    'tests/like_matcher_test',
 ]
 
 perf_tests = [
@@ -480,6 +484,7 @@ scylla_core = (['database.cc',
                 'utils/large_bitset.cc',
                 'utils/buffer_input_stream.cc',
                 'utils/limiting_data_source.cc',
+                'utils/updateable_value.cc',
                 'mutation_partition.cc',
                 'mutation_partition_view.cc',
                 'mutation_partition_serializer.cc',
@@ -490,6 +495,7 @@ scylla_core = (['database.cc',
                 'keys.cc',
                 'counters.cc',
                 'compress.cc',
+                'zstd.cc',
                 'sstables/mp_row_consumer.cc',
                 'sstables/sstables.cc',
                 'sstables/sstables_manager.cc',
@@ -596,6 +602,7 @@ scylla_core = (['database.cc',
                 'db/consistency_level.cc',
                 'db/system_keyspace.cc',
                 'db/system_distributed_keyspace.cc',
+                'db/size_estimates_virtual_reader.cc',
                 'db/schema_tables.cc',
                 'db/cql_type_parser.cc',
                 'db/legacy_schema_migrator.cc',
@@ -718,12 +725,14 @@ scylla_core = (['database.cc',
                 'utils/arch/powerpc/crc32-vpmsum/crc32_wrapper.cc',
                 'querier.cc',
                 'data/cell.cc',
-                'multishard_writer.cc',
+                'mutation_writer/multishard_writer.cc',
                 'multishard_mutation_query.cc',
                 'reader_concurrency_semaphore.cc',
                 'distributed_loader.cc',
                 'utils/utf8.cc',
                 'utils/ascii.cc',
+                'utils/like_matcher.cc',
+                'mutation_writer/timestamp_based_splitting_writer.cc',
                 ] + [Antlr3Grammar('cql3/Cql.g')] + [Thrift('interface/cassandra.thrift', 'Cassandra')]
                )
 
@@ -802,6 +811,7 @@ scylla_tests_dependencies = scylla_core + idls + scylla_tests_generic_dependenci
     'tests/mutation_source_test.cc',
     'tests/data_model.cc',
     'tests/exception_utils.cc',
+    'tests/random_schema.cc',
 ]
 
 deps = {
@@ -834,14 +844,12 @@ pure_boost_tests = set([
     'tests/enum_set_test',
     'tests/cql_auth_syntax_test',
     'tests/meta_test',
-    'tests/imr_test',
-    'tests/partition_data_test',
-    'tests/reusable_buffer_test',
     'tests/observable_test',
     'tests/json_test',
     'tests/auth_passwords_test',
     'tests/top_k_test',
     'tests/small_vector_test',
+    'tests/like_matcher_test',
 ])
 
 tests_not_using_seastar_test_framework = set([
@@ -853,8 +861,6 @@ tests_not_using_seastar_test_framework = set([
     'tests/perf/perf_hash',
     'tests/perf/perf_cql_parser',
     'tests/message',
-    'tests/perf/perf_simple_query',
-    'tests/perf/perf_fast_forward',
     'tests/perf/perf_cache_eviction',
     'tests/row_cache_stress_test',
     'tests/memory_footprint',
@@ -1038,6 +1044,7 @@ total_memory = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
 link_pool_depth = max(int(total_memory / 7e9), 1)
 
 selected_modes = args.selected_modes or modes.keys()
+default_modes = args.selected_modes or ['debug', 'release', 'dev']
 build_modes =  {m: modes[m] for m in selected_modes}
 build_artifacts = all_artifacts if not args.artifacts else args.artifacts
 
@@ -1070,8 +1077,8 @@ modes['debug']['cxxflags'] += ' -gz'
 flag_dest = 'cxx_ld_flags' if args.compress_exec_debuginfo else 'cxxflags'
 modes['release'][flag_dest] += ' -gz'
 
-modes['debug']['cxxflags'] += ' ' + dbgflag
-modes['release']['cxxflags'] += ' ' + dbgflag
+for m in ['debug', 'release', 'sanitize']:
+    modes[m]['cxxflags'] += ' ' + dbgflag
 
 seastar_cflags = args.user_cflags
 seastar_cflags += ' -Wno-error'
@@ -1082,6 +1089,7 @@ seastar_flags += ['--compiler', args.cxx, '--c-compiler', args.cc, '--cflags=%s'
                   '--c++-dialect=gnu++17', '--use-std-optional-variant-stringview=1', '--optflags=%s' % (modes['release']['cxx_ld_flags']), ]
 
 libdeflate_cflags = seastar_cflags
+zstd_cflags = seastar_cflags + ' -Wno-implicit-fallthrough'
 
 status = subprocess.call([args.python, './configure.py'] + seastar_flags, cwd='seastar')
 
@@ -1111,11 +1119,32 @@ for mode in build_modes:
     modes[mode]['seastar_cflags'] = seastar_cflags
     modes[mode]['seastar_libs'] = seastar_libs
 
+MODE_TO_CMAKE_BUILD_TYPE = {'release' : 'RelWithDebInfo', 'debug' : 'Debug', 'dev' : 'Dev', 'sanitize' : 'Sanitize' }
+
+# We need to use experimental features of the zstd library (to use our own allocators for the (de)compression context),
+# which are available only when the library is linked statically.
+def configure_zstd(build_dir, mode):
+    zstd_build_dir = os.path.join(build_dir, mode, 'zstd')
+
+    zstd_cmake_args = [
+        '-DCMAKE_BUILD_TYPE={}'.format(MODE_TO_CMAKE_BUILD_TYPE[mode]),
+        '-DCMAKE_C_COMPILER={}'.format(args.cc),
+        '-DCMAKE_CXX_COMPILER={}'.format(args.cxx),
+        '-DCMAKE_C_FLAGS={}'.format(zstd_cflags),
+        '-DZSTD_BUILD_PROGRAMS=OFF'
+    ]
+
+    zstd_cmd = ['cmake', '-G', 'Ninja', os.path.relpath('zstd/build/cmake', zstd_build_dir)] + zstd_cmake_args
+
+    print(zstd_cmd)
+    os.makedirs(zstd_build_dir, exist_ok=True)
+    subprocess.check_call(zstd_cmd, shell=False, cwd=zstd_build_dir)
+
 args.user_cflags += " " + pkg_config('jsoncpp', '--cflags')
 args.user_cflags += ' -march=' + args.target
 libs = ' '.join([maybe_static(args.staticyamlcpp, '-lyaml-cpp'), '-latomic', '-llz4', '-lz', '-lsnappy', pkg_config('jsoncpp', '--libs'),
                  ' -lstdc++fs', ' -lcrypt', ' -lcryptopp', ' -lpthread',
-                 maybe_static(args.staticboost, '-lboost_date_time'), ])
+                 maybe_static(args.staticboost, '-lboost_date_time -lboost_regex -licuuc'), ])
 
 xxhash_dir = 'xxHash'
 
@@ -1124,6 +1153,17 @@ if not os.path.exists(xxhash_dir) or not os.listdir(xxhash_dir):
 
 if not args.staticboost:
     args.user_cflags += ' -DBOOST_TEST_DYN_LINK'
+
+# thrift version detection, see #4538
+proc_res = subprocess.run(["thrift", "-version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+proc_res_output = proc_res.stdout.decode("utf-8")
+if proc_res.returncode != 0 and not re.search(r'^Thrift version', proc_res_output):
+    raise Exception("Thrift compiler must be missing: {}".format(proc_res_output))
+
+thrift_version = proc_res_output.split(" ")[-1]
+thrift_boost_versions = ["0.{}.".format(n) for n in range(1, 11)]
+if any(filter(thrift_version.startswith, thrift_boost_versions)):
+    args.user_cflags += ' -DTHRIFT_USES_BOOST'
 
 for pkg in pkgs:
     args.user_cflags += ' ' + pkg_config(pkg, '--cflags')
@@ -1150,7 +1190,16 @@ if args.antlr3_exec:
 else:
     antlr3_exec = "antlr3"
 
-with open(buildfile, 'w') as f:
+for mode in build_modes:
+    configure_zstd(outdir, mode)
+
+# configure.py may run automatically from an already-existing build.ninja.
+# If the user interrupts configure.py in the middle, we need build.ninja
+# to remain in a valid state.  So we write our output to a temporary
+# file, and only when done we rename it atomically to build.ninja.
+buildfile_tmp = buildfile + ".tmp"
+
+with open(buildfile_tmp, 'w') as f:
     f.write(textwrap.dedent('''\
         configure_args = {configure_args}
         builddir = {outdir}
@@ -1160,7 +1209,7 @@ with open(buildfile, 'w') as f:
         libs = {libs}
         pool link_pool
             depth = {link_pool_depth}
-        pool seastar_pool
+        pool submodule_pool
             depth = 1
         rule gen
             command = echo -e $text > $out
@@ -1260,7 +1309,8 @@ with open(buildfile, 'w') as f:
                 f.write('build $builddir/{}/{}: ar.{} {}\n'.format(mode, binary, mode, str.join(' ', objs)))
             else:
                 objs.extend(['$builddir/' + mode + '/' + artifact for artifact in [
-                    'libdeflate/libdeflate.a'
+                    'libdeflate/libdeflate.a',
+                    'zstd/lib/libzstd.a',
                 ]])
                 objs.append('$builddir/' + mode + '/gen/utils/gz/crc_combine_table.o')
                 if binary.startswith('tests/'):
@@ -1307,6 +1357,7 @@ with open(buildfile, 'w') as f:
                                             '$builddir/' + mode + '/utils/gz/gen_crc_combine_table'))
         f.write('build {}: link.{} {}\n'.format('$builddir/' + mode + '/utils/gz/gen_crc_combine_table', mode,
                                                 '$builddir/' + mode + '/utils/gz/gen_crc_combine_table.o'))
+        f.write('   libs = $seastar_libs_{}\n'.format(mode))
         f.write(
             'build {mode}-objects: phony {objs}\n'.format(
                 mode=mode,
@@ -1357,22 +1408,28 @@ with open(buildfile, 'w') as f:
 
         f.write('build seastar/build/{mode}/libseastar.a: ninja | always\n'
                 .format(**locals()))
-        f.write('  pool = seastar_pool\n')
+        f.write('  pool = submodule_pool\n')
         f.write('  subdir = seastar/build/{mode}\n'.format(**locals()))
         f.write('  target = seastar seastar_testing\n'.format(**locals()))
         f.write('build seastar/build/{mode}/apps/iotune/iotune: ninja\n'
                 .format(**locals()))
-        f.write('  pool = seastar_pool\n')
+        f.write('  pool = submodule_pool\n')
         f.write('  subdir = seastar/build/{mode}\n'.format(**locals()))
         f.write('  target = iotune\n'.format(**locals()))
         f.write(textwrap.dedent('''\
             build build/{mode}/iotune: copy seastar/build/{mode}/apps/iotune/iotune
             ''').format(**locals()))
         f.write('build build/{mode}/scylla-package.tar.gz: package build/{mode}/scylla build/{mode}/iotune build/SCYLLA-RELEASE-FILE build/SCYLLA-VERSION-FILE | always\n'.format(**locals()))
-        f.write('    mode = {mode}\n'.format(**locals()))
+        f.write('  pool = submodule_pool\n')
+        f.write('  mode = {mode}\n'.format(**locals()))
         f.write('rule libdeflate.{mode}\n'.format(**locals()))
-        f.write('    command = make -C libdeflate BUILD_DIR=../build/{mode}/libdeflate/ CFLAGS="{libdeflate_cflags}" CC={args.cc} ../build/{mode}/libdeflate//libdeflate.a\n'.format(**locals()))
+        f.write('  command = make -C libdeflate BUILD_DIR=../build/{mode}/libdeflate/ CFLAGS="{libdeflate_cflags}" CC={args.cc} ../build/{mode}/libdeflate//libdeflate.a\n'.format(**locals()))
         f.write('build build/{mode}/libdeflate/libdeflate.a: libdeflate.{mode}\n'.format(**locals()))
+        f.write('  pool = submodule_pool\n')
+        f.write('build build/{mode}/zstd/lib/libzstd.a: ninja\n'.format(**locals()))
+        f.write('  pool = submodule_pool\n')
+        f.write('  subdir = build/{mode}/zstd\n'.format(**locals()))
+        f.write('  target = libzstd.a\n'.format(**locals()))
 
     mode = 'dev' if 'dev' in modes else modes[0]
     f.write('build checkheaders: phony || {}\n'.format(' '.join(['$builddir/{}/{}.o'.format(mode, hh) for hh in headers])))
@@ -1391,10 +1448,12 @@ with open(buildfile, 'w') as f:
             description = CLEAN
         build clean: clean
         default {modes_list}
-        ''').format(modes_list=' '.join(build_modes), **globals()))
+        ''').format(modes_list=' '.join(default_modes), **globals()))
     f.write(textwrap.dedent('''\
         build always: phony
         rule scylla_version_gen
             command = ./SCYLLA-VERSION-GEN
         build build/SCYLLA-RELEASE-FILE build/SCYLLA-VERSION-FILE: scylla_version_gen
         ''').format(modes_list=' '.join(build_modes), **globals()))
+
+os.rename(buildfile_tmp, buildfile)

@@ -49,26 +49,48 @@
 using namespace std::literals::chrono_literals;
 
 SEASTAR_TEST_CASE(test_large_partitions) {
-    db::config cfg{};
-    cfg.compaction_large_partition_warning_threshold_mb(0);
+    auto cfg = make_shared<db::config>();
+    cfg->compaction_large_partition_warning_threshold_mb(0);
     return do_with_cql_env([](cql_test_env& e) { return make_ready_future<>(); }, cfg);
 }
 
+static void flush(cql_test_env& e) {
+    e.db().invoke_on_all([](database& dbi) {
+        return dbi.flush_all_memtables();
+    }).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_large_collection) {
+    auto cfg = make_shared<db::config>();
+    cfg->compaction_large_cell_warning_threshold_mb(1);
+    do_with_cql_env([](cql_test_env& e) {
+        e.execute_cql("create table tbl (a int, b list<text>, primary key (a))").get();
+        e.execute_cql("insert into tbl (a, b) values (42, []);").get();
+        sstring blob(1024, 'x');
+        for (unsigned i = 0; i < 1024; ++i) {
+            e.execute_cql("update tbl set b = ['" + blob + "'] + b where a = 42;").get();
+        }
+
+        flush(e);
+        assert_that(e.execute_cql("select partition_key, column_name from system.large_cells where table_name = 'tbl' allow filtering;").get0())
+            .is_rows()
+            .with_size(1)
+            .with_row({"42", "b", "tbl"});
+
+        return make_ready_future<>();
+    }, cfg).get();
+}
+
 SEASTAR_THREAD_TEST_CASE(test_large_data) {
-    db::config cfg{};
-    cfg.compaction_large_row_warning_threshold_mb(1);
-    cfg.compaction_large_cell_warning_threshold_mb(1);
+    auto cfg = make_shared<db::config>();
+    cfg->compaction_large_row_warning_threshold_mb(1);
+    cfg->compaction_large_cell_warning_threshold_mb(1);
     do_with_cql_env([](cql_test_env& e) {
         e.execute_cql("create table tbl (a int, b text, primary key (a))").get();
         sstring blob(1024*1024, 'x');
         e.execute_cql("insert into tbl (a, b) values (42, 'foo');").get();
         e.execute_cql("insert into tbl (a, b) values (44, '" + blob + "');").get();
-        auto flush = [&] {
-            e.db().invoke_on_all([] (database& dbi) {
-                return dbi.flush_all_memtables();
-            }).get();
-        };
-        flush();
+        flush(e);
 
         shared_ptr<cql_transport::messages::result_message> msg = e.execute_cql("select partition_key, row_size from system.large_rows where table_name = 'tbl' allow filtering;").get0();
         auto res = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(msg);
@@ -101,7 +123,7 @@ SEASTAR_THREAD_TEST_CASE(test_large_data) {
         // * flush, so that a thumbstone for the above delete is created.
         // * do a major compaction, so that the thumbstone is combined with the old entry.
         // * stop the db, as only then do we wait for sstable deletions.
-        flush();
+        flush(e);
         e.db().invoke_on_all([] (database& dbi) {
             return parallel_for_each(dbi.get_column_families(), [&dbi] (auto& table) {
                 return dbi.get_compaction_manager().submit_major_compaction(&*table.second);
@@ -1042,18 +1064,12 @@ SEASTAR_TEST_CASE(test_range_deletion_scenarios) {
             e.execute_cql(format("insert into cf (p, c, v) values (1, {:d}, 'abc');", i)).get();
         }
 
-        try {
-            e.execute_cql("delete from cf where p = 1 and c <= 3").get();
-            BOOST_FAIL("should've thrown");
-        } catch (...) { }
-        try {
-            e.execute_cql("delete from cf where p = 1 and c >= 0").get();
-            BOOST_FAIL("should've thrown");
-        } catch (...) { }
+        e.execute_cql("delete from cf where p = 1 and c <= 3").get();
+        e.execute_cql("delete from cf where p = 1 and c >= 8").get();
 
-        e.execute_cql("delete from cf where p = 1 and c >= 0 and c <= 3").get();
+        e.execute_cql("delete from cf where p = 1 and c >= 0 and c <= 5").get();
         auto msg = e.execute_cql("select * from cf").get0();
-        assert_that(msg).is_rows().with_size(6);
+        assert_that(msg).is_rows().with_size(2);
         e.execute_cql("delete from cf where p = 1 and c > 3 and c < 10").get();
         msg = e.execute_cql("select * from cf").get0();
         assert_that(msg).is_rows().with_size(0);
@@ -1525,6 +1541,18 @@ SEASTAR_TEST_CASE(test_user_type_nested) {
     return do_with_cql_env_thread([] (cql_test_env& e) {
         e.execute_cql("create type ut1 (f1 int);").get();
         e.execute_cql("create type ut2 (f2 frozen<ut1>);").get();
+    });
+}
+
+SEASTAR_TEST_CASE(test_user_type_reversed) {
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("create type my_type (a int);").get();
+        e.execute_cql("create table tbl (a int, b frozen<my_type>, primary key ((a), b)) with clustering order by (b desc);").get();
+        e.execute_cql("insert into tbl (a, b) values (1, (2));").get();
+        assert_that(e.execute_cql("select a,b.a from tbl;").get0())
+                .is_rows()
+                .with_size(1)
+                .with_row({int32_type->decompose(1), int32_type->decompose(2)});
     });
 }
 
@@ -2491,8 +2519,8 @@ SEASTAR_TEST_CASE(test_in_restriction) {
             return e.execute_cql("select r1 from tir2 where (c1,r1) in ((0, 1),(1,2),(0,1),(1,2),(3,3)) ALLOW FILTERING;");
         }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
             assert_that(msg).is_rows().with_rows({
-                {int32_type->decompose(1)},
-                {int32_type->decompose(2)},
+                {int32_type->decompose(1), int32_type->decompose(0)},
+                {int32_type->decompose(2), int32_type->decompose(1)},
             });
         }).then([&e] {
              return e.prepare("select r1 from tir2 where (c1,r1) in ? ALLOW FILTERING;");
@@ -2517,8 +2545,8 @@ SEASTAR_TEST_CASE(test_in_restriction) {
             return e.execute_prepared(prepared_id,raw_values);
         }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
             assert_that(msg).is_rows().with_rows({
-                {int32_type->decompose(1)},
-                {int32_type->decompose(2)},
+                {int32_type->decompose(1), int32_type->decompose(0)},
+                {int32_type->decompose(2), int32_type->decompose(1)},
             });
         });
     });
@@ -3681,7 +3709,7 @@ void require_rows(cql_test_env& e,
                   const std::vector<std::vector<bytes_opt>>& expected,
                   const source_location& loc = source_location::current()) {
     try {
-        assert_that(cquery_nofail(e, qstr, loc)).is_rows().with_rows_ignore_order(expected);
+        assert_that(cquery_nofail(e, qstr, nullptr, loc)).is_rows().with_rows_ignore_order(expected);
     }
     catch (const std::exception& e) {
         BOOST_FAIL(format("query '{}' failed: {}\n{}:{}: originally from here",
@@ -3782,7 +3810,7 @@ SEASTAR_TEST_CASE(test_group_by_text_key) {
         require_rows(e, "select avg(v) from t2 group by p", {{I(25), T(" ")}});
         require_rows(e, "select avg(v) from t2 group by p, c1", {{I(15), T(" "), T("")}, {I(35), T(" "), T("a")}});
         require_rows(e, "select sum(v) from t2 where c1='' group by p, c2 allow filtering",
-                     {{I(10), T(" "), T("")}, {I(20), T(" "), T("b")}});
+                     {{I(10), T(""), T(" "), T("")}, {I(20), T(""), T(" "), T("b")}});
         return make_ready_future<>();
     });
 }
@@ -3824,5 +3852,149 @@ SEASTAR_TEST_CASE(test_aggregate_and_simple_selection_together) {
         require_rows(e, "select p, sum(v) from t", {{I(1), I(58)}});
         require_rows(e, "select p, count(c) from t group by p", {{I(1), L(3)}, {I(2), L(1)}});
         return make_ready_future<>();
+    });
+}
+
+SEASTAR_TEST_CASE(test_like_operator) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        cquery_nofail(e, "create table t (p int primary key, s text)");
+        require_rows(e, "select s from t where s like 'abc' allow filtering", {});
+        cquery_nofail(e, "insert into t (p, s) values (1, 'abc')");
+        require_rows(e, "select s from t where s like 'abc' allow filtering", {{T("abc")}});
+        require_rows(e, "select s from t where s like 'ab_' allow filtering", {{T("abc")}});
+        cquery_nofail(e, "insert into t (p, s) values (2, 'abb')");
+        require_rows(e, "select s from t where s like 'ab_' allow filtering", {{T("abc")}, {T("abb")}});
+        require_rows(e, "select s from t where s like '%c' allow filtering", {{T("abc")}});
+        require_rows(e, "select s from t where s like 'aaa' allow filtering", {});
+    });
+}
+
+SEASTAR_TEST_CASE(test_like_operator_on_partition_key) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        // Fully constrained:
+        cquery_nofail(e, "create table t (s text primary key)");
+        cquery_nofail(e, "insert into t (s) values ('abc')");
+        require_rows(e, "select s from t where s like 'a__' allow filtering", {{T("abc")}});
+        cquery_nofail(e, "insert into t (s) values ('acc')");
+        require_rows(e, "select s from t where s like 'a__' allow filtering", {{T("abc")}, {T("acc")}});
+
+        // Partially constrained:
+        cquery_nofail(e, "create table t2 (s1 text, s2 text, primary key((s1, s2)))");
+        cquery_nofail(e, "insert into t2 (s1, s2) values ('abc', 'abc')");
+        require_rows(e, "select s2 from t2 where s2 like 'a%' allow filtering", {{T("abc")}});
+        cquery_nofail(e, "insert into t2 (s1, s2) values ('aba', 'aba')");
+        require_rows(e, "select s2 from t2 where s2 like 'a%' allow filtering", {{T("abc")}, {T("aba")}});
+    });
+}
+
+SEASTAR_TEST_CASE(test_like_operator_on_clustering_key) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        cquery_nofail(e, "create table t (p int, s text, primary key(p, s))");
+        cquery_nofail(e, "insert into t (p, s) values (1, 'abc')");
+        require_rows(e, "select s from t where s like '%c' allow filtering", {{T("abc")}});
+        cquery_nofail(e, "insert into t (p, s) values (2, 'acc')");
+        require_rows(e, "select s from t where s like '%c' allow filtering", {{T("abc")}, {T("acc")}});
+    });
+}
+
+SEASTAR_TEST_CASE(test_like_operator_conjunction) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        cquery_nofail(e, "create table t (s1 text primary key, s2 text)");
+        cquery_nofail(e, "insert into t (s1, s2) values ('abc', 'ABC')");
+        cquery_nofail(e, "insert into t (s1, s2) values ('a', 'A')");
+        require_rows(e, "select * from t where s1 like 'a%' and s2 like '__C' allow filtering",
+                     {{T("abc"), T("ABC")}});
+        BOOST_REQUIRE_EXCEPTION(
+                e.execute_cql("select * from t where s1 like 'a%' and s1 = 'abc' allow filtering").get(),
+                exceptions::invalid_request_exception,
+                exception_predicate::message_contains("more than one relation"));
+    });
+}
+
+SEASTAR_TEST_CASE(test_like_operator_static_column) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        cquery_nofail(e, "create table t (p int, c text, s text static, primary key(p, c))");
+        require_rows(e, "select s from t where s like '%c' allow filtering", {});
+        cquery_nofail(e, "insert into t (p, s) values (1, 'abc')");
+        require_rows(e, "select s from t where s like '%c' allow filtering", {{T("abc")}});
+        require_rows(e, "select * from t where c like '%' allow filtering", {});
+    });
+}
+
+SEASTAR_TEST_CASE(test_like_operator_bind_marker) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        cquery_nofail(e, "create table t (s text primary key, )");
+        cquery_nofail(e, "insert into t (s) values ('abc')");
+        try {
+            auto result = e.execute_prepared(
+                    e.prepare("select s from t where s like ? allow filtering").get0(),
+                    {cql3::raw_value::make_value(T("_b_"))}).get0();
+            assert_that(result).is_rows().with_rows_ignore_order({{T("abc")}});
+        }
+        catch (const std::exception& e) {
+            BOOST_FAIL(e.what());
+        }
+    });
+}
+
+SEASTAR_TEST_CASE(test_like_operator_blank_pattern) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        cquery_nofail(e, "create table t (p int primary key, s text)");
+        cquery_nofail(e, "insert into t (p, s) values (1, 'abc')");
+        require_rows(e, "select s from t where s like '' allow filtering", {});
+        cquery_nofail(e, "insert into t (p, s) values (2, '')");
+        require_rows(e, "select s from t where s like '' allow filtering", {{T("")}});
+    });
+}
+
+SEASTAR_TEST_CASE(test_like_operator_ascii) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        cquery_nofail(e, "create table t (s ascii primary key, )");
+        cquery_nofail(e, "insert into t (s) values ('abc')");
+        require_rows(e, "select s from t where s like '%c' allow filtering", {{T("abc")}});
+    });
+}
+
+SEASTAR_TEST_CASE(test_like_operator_varchar) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        cquery_nofail(e, "create table t (s varchar primary key, )");
+        cquery_nofail(e, "insert into t (s) values ('abc')");
+        require_rows(e, "select s from t where s like '%c' allow filtering", {{T("abc")}});
+    });
+}
+
+SEASTAR_TEST_CASE(test_alter_type_on_compact_storage_with_no_regular_columns_does_not_crash) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        cquery_nofail(e, "CREATE TYPE my_udf (first text);");
+        cquery_nofail(e, "create table z (pk int, ck frozen<my_udf>, primary key(pk, ck)) with compact storage;");
+        cquery_nofail(e, "alter type my_udf add test_int int;");
+    });
+}
+
+SEASTAR_TEST_CASE(test_like_operator_on_nonstring) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        cquery_nofail(e, "create table t (k int primary key, s text)");
+        BOOST_REQUIRE_EXCEPTION(
+                e.execute_cql("select * from t where k like 123 allow filtering").get(),
+                exceptions::invalid_request_exception,
+                exception_predicate::message_contains("only on string types"));
+#if 0 // TODO: Enable when query::result_set::consume() is fixed.
+        BOOST_REQUIRE_EXCEPTION(
+                e.execute_prepared(
+                        e.prepare("select s from t where s like ? allow filtering").get0(),
+                        {cql3::raw_value::make_value(I(1))}).get(),
+                exceptions::invalid_request_exception,
+                exception_predicate::message_contains("only on string types"));
+#endif
+    });
+}
+
+SEASTAR_TEST_CASE(test_like_operator_on_token) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        cquery_nofail(e, "create table t (s text primary key)");
+        BOOST_REQUIRE_EXCEPTION(
+                e.execute_cql("select * from t where token(s) like 'abc' allow filtering").get(),
+                exceptions::invalid_request_exception,
+                exception_predicate::message_contains("token function"));
     });
 }

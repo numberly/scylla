@@ -37,6 +37,7 @@
 #include "db/timeout_clock.hh"
 #include "service/priority_manager.hh"
 #include "database.hh"
+#include "service_permit.hh"
 
 using namespace std::literals::chrono_literals;
 
@@ -161,7 +162,6 @@ bool manager::end_point_hints_manager::store_hint(schema_ptr s, lw_shared_ptr<co
             ++_hints_in_progress;
             size_t mut_size = fm->representation().size();
             shard_stats().size_of_hints_in_progress += mut_size;
-            shard_resource_manager().inc_size_of_hints_in_progress(mut_size);
 
             return with_shared(file_update_mutex(), [this, fm, s, tr_state] () mutable -> future<> {
                 return get_or_load().then([this, fm = std::move(fm), s = std::move(s), tr_state] (hints_store_ptr log_ptr) mutable {
@@ -182,7 +182,6 @@ bool manager::end_point_hints_manager::store_hint(schema_ptr s, lw_shared_ptr<co
             }).finally([this, mut_size, fm, s] {
                 --_hints_in_progress;
                 shard_stats().size_of_hints_in_progress -= mut_size;
-                shard_resource_manager().dec_size_of_hints_in_progress(mut_size);
             });;
         });
     } catch (...) {
@@ -405,7 +404,7 @@ future<> manager::end_point_hints_manager::sender::do_send_one_mutation(frozen_m
             // unavailable exception.
             auto timeout = db::timeout_clock::now() + 1h;
             //FIXME: Add required frozen_mutation overloads
-            return _proxy.mutate({m.fm.unfreeze(m.s)}, consistency_level::ALL, timeout, nullptr);
+            return _proxy.mutate({m.fm.unfreeze(m.s)}, consistency_level::ALL, timeout, nullptr, empty_service_permit());
         }
     });
 }
@@ -479,7 +478,7 @@ const column_mapping& manager::end_point_hints_manager::sender::get_column_mappi
 bool manager::too_many_in_flight_hints_for(ep_key_type ep) const noexcept {
     // There is no need to check the DC here because if there is an in-flight hint for this end point then this means that
     // its DC has already been checked and found to be ok.
-    return _resource_manager.too_many_hints_in_progress() && !utils::fb_utilities::is_me(ep) && hints_in_progress_for(ep) > 0 && local_gossiper().get_endpoint_downtime(ep) <= _max_hint_window_us;
+    return _stats.size_of_hints_in_progress > max_size_of_hints_in_progress && !utils::fb_utilities::is_me(ep) && hints_in_progress_for(ep) > 0 && local_gossiper().get_endpoint_downtime(ep) <= _max_hint_window_us;
 }
 
 bool manager::can_hint_for(ep_key_type ep) const noexcept {
@@ -496,8 +495,8 @@ bool manager::can_hint_for(ep_key_type ep) const noexcept {
     // hints is more than the maximum allowed value.
     //
     // In the worst case there's going to be (_max_size_of_hints_in_progress + N - 1) in-flight hints, where N is the total number Nodes in the cluster.
-    if (_resource_manager.too_many_hints_in_progress() && hints_in_progress_for(ep) > 0) {
-        manager_logger.trace("size_of_hints_in_progress {} hints_in_progress_for({}) {}", _resource_manager.size_of_hints_in_progress(), ep, hints_in_progress_for(ep));
+    if (_stats.size_of_hints_in_progress > max_size_of_hints_in_progress && hints_in_progress_for(ep) > 0) {
+        manager_logger.trace("size_of_hints_in_progress {} hints_in_progress_for({}) {}", _stats.size_of_hints_in_progress, ep, hints_in_progress_for(ep));
         return false;
     }
 

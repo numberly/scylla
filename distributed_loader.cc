@@ -192,7 +192,11 @@ future<> verification_error(fs::path path, const char* fstr, Args&&... args) {
 // No other file types may exist.
 future<> distributed_loader::verify_owner_and_mode(fs::path path) {
     return file_stat(path.string(), follow_symlink::no).then([path = std::move(path)] (stat_data sd) {
-        if (sd.uid != geteuid()) {
+        // Under docker, we run with euid 0 and there is no reasonable way to enforce that the
+        // in-container uid will have the same uid as files mounted from outside the container. So
+        // just allow euid 0 as a special case. It should survive the file_accessible() checks below.
+        // See #4823.
+        if (geteuid() != 0 && sd.uid != geteuid()) {
             return verification_error(std::move(path), "File not owned by current euid: {}. Owner is: {}", geteuid(), sd.uid);
         }
         switch (sd.type) {
@@ -610,7 +614,7 @@ future<> distributed_loader::cleanup_column_family_temp_sst_dirs(sstring sstdir)
             fs::path dirpath = sstdir / de.name;
             if (sstables::sstable::is_temp_dir(dirpath)) {
                 dblog.info("Found temporary sstable directory: {}, removing", dirpath);
-                futures.push_back(lister::rmdir(dirpath));
+                futures.push_back(io_check([dirpath = std::move(dirpath)] () { return lister::rmdir(dirpath); }));
             }
             return make_ready_future<>();
         }).then([&futures] {

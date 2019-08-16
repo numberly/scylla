@@ -69,17 +69,11 @@ private:
     schema_ptr _schema;
     bool _allow_filtering;
     ::shared_ptr<single_column_restrictions> _restrictions;
-    bool _slice;
-    bool _contains;
-    bool _in;
 public:
     single_column_primary_key_restrictions(schema_ptr schema, bool allow_filtering)
         : _schema(schema)
         , _allow_filtering(allow_filtering)
         , _restrictions(::make_shared<single_column_restrictions>(schema))
-        , _slice(false)
-        , _contains(false)
-        , _in(false)
     { }
 
     // Convert another primary key restrictions type into this type, possibly using different schema
@@ -88,9 +82,6 @@ public:
         : _schema(schema)
         , _allow_filtering(other._allow_filtering)
         , _restrictions(::make_shared<single_column_restrictions>(schema))
-        , _slice(other._slice)
-        , _contains(other._contains)
-        , _in(other._in)
     {
         for (const auto& entry : other._restrictions->restrictions()) {
             const column_definition* other_cdef = entry.first;
@@ -101,26 +92,6 @@ public:
             ::shared_ptr<single_column_restriction> restriction = entry.second;
             _restrictions->add_restriction(restriction->apply_to(*this_cdef));
         }
-    }
-
-    virtual bool is_on_token() const override {
-        return false;
-    }
-
-    virtual bool is_multi_column() const override {
-        return false;
-    }
-
-    virtual bool is_slice() const override {
-        return _slice;
-    }
-
-    virtual bool is_contains() const override {
-        return _contains;
-    }
-
-    virtual bool is_IN() const override {
-        return _in;
     }
 
     virtual bool is_all_eq() const override {
@@ -144,7 +115,7 @@ public:
             auto last_column = *_restrictions->last_column();
             auto new_column = restriction->get_column_def();
 
-            if (_slice && _schema->position(new_column) > _schema->position(last_column)) {
+            if (this->is_slice() && _schema->position(new_column) > _schema->position(last_column)) {
                 throw exceptions::invalid_request_exception(format("Clustering column \"{}\" cannot be restricted (preceding column \"{}\" is restricted by a non-EQ relation)",
                     new_column.name_as_text(), last_column.name_as_text()));
             }
@@ -156,10 +127,7 @@ public:
                 }
             }
         }
-
-        _slice |= restriction->is_slice();
-        _in |= restriction->is_IN();
-        _contains |= restriction->is_contains();
+        restriction::_ops.add(restriction->get_ops());
         _restrictions->add_restriction(restriction);
     }
 
@@ -264,7 +232,7 @@ private:
             const column_definition* def = e.first;
             auto&& r = e.second;
 
-            if (vec_of_values.size() != _schema->position(*def) || r->is_contains()) {
+            if (vec_of_values.size() != _schema->position(*def) || r->is_contains() || r->is_LIKE()) {
                 // The prefixes built so far are the longest we can build,
                 // the rest of the constraints will have to be applied using filtering.
                 break;

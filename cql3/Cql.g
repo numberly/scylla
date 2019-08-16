@@ -1128,10 +1128,10 @@ createUserStatement returns [::shared_ptr<create_role_statement> stmt]
 
         bool ifNotExists = false;
     }
-    : K_CREATE K_USER (K_IF K_NOT K_EXISTS { ifNotExists = true; })? username
+    : K_CREATE K_USER (K_IF K_NOT K_EXISTS { ifNotExists = true; })? u=username
       ( K_WITH K_PASSWORD v=STRING_LITERAL { opts.password = $v.text; })?
       ( K_SUPERUSER { opts.is_superuser = true; } | K_NOSUPERUSER { opts.is_superuser = false; } )?
-      { $stmt = ::make_shared<create_role_statement>(cql3::role_name($username.text, cql3::preserve_role_case::yes), std::move(opts), ifNotExists); }
+      { $stmt = ::make_shared<create_role_statement>(cql3::role_name(u, cql3::preserve_role_case::yes), std::move(opts), ifNotExists); }
     ;
 
 /**
@@ -1141,10 +1141,10 @@ alterUserStatement returns [::shared_ptr<alter_role_statement> stmt]
     @init {
         cql3::role_options opts;
     }
-    : K_ALTER K_USER username
+    : K_ALTER K_USER u=username
       ( K_WITH K_PASSWORD v=STRING_LITERAL { opts.password = $v.text; })?
       ( K_SUPERUSER { opts.is_superuser = true; } | K_NOSUPERUSER { opts.is_superuser = false; } )?
-      { $stmt = ::make_shared<alter_role_statement>(cql3::role_name($username.text, cql3::preserve_role_case::yes), std::move(opts)); }
+      { $stmt = ::make_shared<alter_role_statement>(cql3::role_name(u, cql3::preserve_role_case::yes), std::move(opts)); }
     ;
 
 /**
@@ -1152,8 +1152,8 @@ alterUserStatement returns [::shared_ptr<alter_role_statement> stmt]
  */
 dropUserStatement returns [::shared_ptr<drop_role_statement> stmt]
     @init { bool ifExists = false; }
-    : K_DROP K_USER (K_IF K_EXISTS { ifExists = true; })? username
-      { $stmt = ::make_shared<drop_role_statement>(cql3::role_name($username.text, cql3::preserve_role_case::yes), ifExists); }
+    : K_DROP K_USER (K_IF K_EXISTS { ifExists = true; })? u=username
+      { $stmt = ::make_shared<drop_role_statement>(cql3::role_name(u, cql3::preserve_role_case::yes), ifExists); }
     ;
 
 /**
@@ -1491,6 +1491,7 @@ relationType returns [const cql3::operator_type* op = nullptr]
     | '>'  { $op = &cql3::operator_type::GT; }
     | '>=' { $op = &cql3::operator_type::GTE; }
     | '!=' { $op = &cql3::operator_type::NEQ; }
+    | K_LIKE { $op = &cql3::operator_type::LIKE; }
     ;
 
 relation[std::vector<cql3::relation_ptr>& clauses]
@@ -1664,9 +1665,10 @@ tuple_type [bool internal] returns [shared_ptr<cql3::cql3_type::raw> t]
       '>' { $t = cql3::cql3_type::raw::tuple(std::move(types)); }
     ;
 
-username
-    : IDENT
-    | STRING_LITERAL
+username returns [sstring str]
+    : t=IDENT { $str = $t.text; }
+    | t=STRING_LITERAL { $str = $t.text; }
+    | s=unreserved_keyword { $str = s; }
     | QUOTED_NAME { add_recognition_error("Quoted strings are not supported for user names"); }
     ;
 
@@ -1735,6 +1737,7 @@ basic_unreserved_keyword returns [sstring str]
         | K_JSON
         | K_CACHE
         | K_BYPASS
+        | K_LIKE
         | K_PER
         | K_PARTITION
         | K_GROUP
@@ -1889,7 +1892,9 @@ K_PARTITION:   P A R T I T I O N;
 K_SCYLLA_TIMEUUID_LIST_INDEX: S C Y L L A '_' T I M E U U I D '_' L I S T '_' I N D E X;
 K_SCYLLA_COUNTER_SHARD_LIST: S C Y L L A '_' C O U N T E R '_' S H A R D '_' L I S T; 
 
-K_GROUP:      G R O U P;
+K_GROUP:       G R O U P;
+
+K_LIKE:        L I K E;
 
 // Case-insensitive alpha characters
 fragment A: ('a'|'A');

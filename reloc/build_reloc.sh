@@ -2,16 +2,24 @@
 
 . /etc/os-release
 
+DEFAULT_FLAGS="--enable-dpdk"
+DEFAULT_MODE="release"
+
 print_usage() {
-    echo "build_reloc.sh --jobs 2"
-    echo "  --jobs  specify number of jobs"
-    echo "  --clean clean build directory"
-    echo "  --compiler  C++ compiler path"
-    echo "  --c-compiler C compiler path"
-    echo "  --nodeps    skip installing dependencies"
+    echo "Usage: build_reloc.sh [OPTION]..."
+    echo ""
+    echo "  --configure-flags FLAGS specify build flags passed to 'configure.py' (default: '$DEFAULT_FLAGS')"
+    echo "  --mode MODE             specify build mode (default: '$DEFAULT_MODE')"
+    echo "  --jobs JOBS             specify number of jobs"
+    echo "  --clean                 clean build directory"
+    echo "  --compiler PATH         C++ compiler path"
+    echo "  --c-compiler PATH       C compiler path"
+    echo "  --nodeps                skip installing dependencies"
     exit 1
 }
 
+FLAGS="$DEFAULT_FLAGS"
+MODE="$DEFAULT_MODE"
 JOBS=
 CLEAN=
 COMPILER=
@@ -19,6 +27,14 @@ CCOMPILER=
 NODEPS=
 while [ $# -gt 0 ]; do
     case "$1" in
+        "--configure-flags")
+            FLAGS=$2
+            shift 2
+            ;;
+        "--mode")
+            MODE=$2
+            shift 2
+            ;;
         "--jobs")
             JOBS="-j$2"
             shift 2
@@ -62,8 +78,8 @@ if [ "$CLEAN" = "yes" ]; then
     rm -rf build
 fi
 
-if [ -f build/release/scylla-package.tar.gz ]; then
-    rm build/release/scylla-package.tar.gz
+if [ -f build/$MODE/scylla-package.tar.gz ]; then
+    rm build/$MODE/scylla-package.tar.gz
 fi
 
 if [ -z "$NODEPS" ]; then
@@ -79,12 +95,14 @@ if [ -z "$NINJA" ]; then
     exit 1
 fi
 
-FLAGS="--with=scylla --with=iotune --enable-dpdk --mode=release"
+FLAGS="$FLAGS --mode=$MODE"
 if [ -n "$COMPILER" ]; then
     FLAGS="$FLAGS --compiler $COMPILER"
 fi
 if [ -n "$CCOMPILER" ]; then
     FLAGS="$FLAGS --c-compiler $CCOMPILER"
 fi
+echo "Configuring with flags: '$FLAGS' ..."
 ./configure.py $FLAGS
-$NINJA $JOBS build/release/scylla-package.tar.gz
+python3 -m compileall ./dist/common/scripts/ ./seastar/scripts/perftune.py ./tools/scyllatop
+$NINJA $JOBS build/$MODE/scylla-package.tar.gz

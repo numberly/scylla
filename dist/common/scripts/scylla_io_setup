@@ -90,7 +90,7 @@ if __name__ == "__main__":
                 conf_dir = os.environ["SCYLLA_CONF"]
             else:
                 conf_dir = "/etc/scylla"
-            cfg = yaml.load(open(os.path.join(conf_dir, "scylla.yaml")))
+            cfg = yaml.safe_load(open(os.path.join(conf_dir, "scylla.yaml")))
             if not "data_file_directories" in cfg:
                 logging.error("No data directories found. Please check the configuration and run scylla_io_setup again.\n")
                 sys.exit(1)
@@ -136,6 +136,6 @@ if __name__ == "__main__":
                               "This is a non-supported setup, and performance is expected to be very bad.\n"
                               "For better performance, placing your data on XFS-formatted directories is required.\n"
                               "To override this error, enable developer mode as follow:\n"
-                              "sudo /usr/lib/scylla/scylla_dev_mode_setup --developer-mode 1", data_dirs)
+                              "sudo /opt/scylladb/scripts/scylla_dev_mode_setup --developer-mode 1", data_dirs)
                 sys.exit(1)
 

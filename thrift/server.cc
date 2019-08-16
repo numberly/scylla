@@ -41,7 +41,10 @@
 #include <limits>
 #include <cctype>
 #include <vector>
+
+#ifdef THRIFT_USES_BOOST
 #include <boost/make_shared.hpp>
+#endif
 
 static logging::logger tlogger("thrift");
 
@@ -97,9 +100,9 @@ struct thrift_server::connection::fake_transport : TTransport {
 thrift_server::connection::connection(thrift_server& server, connected_socket&& fd, socket_address addr)
         : _server(server), _fd(std::move(fd)), _read_buf(_fd.input())
         , _write_buf(_fd.output())
-        , _transport(boost::make_shared<thrift_server::connection::fake_transport>(this))
-        , _input(boost::make_shared<TMemoryBuffer>())
-        , _output(boost::make_shared<TMemoryBuffer>())
+        , _transport(thrift_std::make_shared<thrift_server::connection::fake_transport>(this))
+        , _input(thrift_std::make_shared<TMemoryBuffer>())
+        , _output(thrift_std::make_shared<TMemoryBuffer>())
         , _in_proto(_server._protocol_factory->getProtocol(_input))
         , _out_proto(_server._protocol_factory->getProtocol(_output))
         , _processor(_server._processor_factory->getProcessor({ _in_proto, _out_proto, _transport })) {
@@ -213,10 +216,10 @@ thrift_server::connection::shutdown() {
 }
 
 future<>
-thrift_server::listen(ipv4_addr addr, bool keepalive) {
+thrift_server::listen(socket_address addr, bool keepalive) {
     listen_options lo;
     lo.reuse_address = true;
-    _listeners.push_back(engine().listen(make_ipv4_address(addr), lo));
+    _listeners.push_back(engine().listen(addr, lo));
     do_accepts(_listeners.size() - 1, keepalive);
     return make_ready_future<>();
 }
@@ -227,7 +230,8 @@ thrift_server::do_accepts(int which, bool keepalive) {
         return;
     }
     with_gate(_stop_gate, [&, this] {
-        return _listeners[which].accept().then([this, which, keepalive] (connected_socket fd, socket_address addr) {
+        return _listeners[which].accept().then([this, which, keepalive] (accept_result ar) {
+            auto&& [fd, addr] = ar;
             fd.set_nodelay(true);
             fd.set_keepalive(keepalive);
             with_gate(_stop_gate, [&, this] {

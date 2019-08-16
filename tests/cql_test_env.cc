@@ -59,12 +59,17 @@
 using namespace std::chrono_literals;
 
 cql_test_config::cql_test_config()
-    : cql_test_config(db::config())
+    : cql_test_config(make_shared<db::config>())
 {}
 
-cql_test_config::cql_test_config(const db::config& cfg)
-    : db_config(seastar::make_shared<db::config>(cfg))
-{}
+cql_test_config::cql_test_config(shared_ptr<db::config> cfg)
+    : db_config(cfg)
+{
+    // This causes huge amounts of commitlog writes to allocate space on disk,
+    // which all get thrown away when the test is done. This can cause timeouts
+    // if /tmp is not tmpfs.
+    db_config->commitlog_use_o_dsync.set(false);
+}
 
 cql_test_config::cql_test_config(const cql_test_config&) = default;
 cql_test_config::~cql_test_config() = default;
@@ -130,7 +135,7 @@ private:
         if (_db->local().has_keyspace(ks_name)) {
             _core_local.local().client_state.set_keyspace(_db->local(), ks_name);
         }
-        return ::make_shared<service::query_state>(_core_local.local().client_state);
+        return ::make_shared<service::query_state>(_core_local.local().client_state, empty_service_permit());
     }
 public:
     single_node_cql_env(
@@ -330,21 +335,22 @@ public:
             auto wait_for_background_jobs = defer([] { sstables::await_background_jobs_on_all_shards().get(); });
 
             auto db = ::make_shared<distributed<database>>();
-            auto cfg = make_lw_shared<db::config>(*cfg_in.db_config);
+            auto cfg = cfg_in.db_config;
             tmpdir data_dir;
             auto data_dir_path = data_dir.path().string();
             if (!cfg->data_file_directories.is_set()) {
-                cfg->data_file_directories() = {data_dir_path};
+                cfg->data_file_directories.set({data_dir_path});
             } else {
                 data_dir_path = cfg->data_file_directories()[0];
             }
-            cfg->commitlog_directory() = data_dir_path + "/commitlog.dir";
-            cfg->hints_directory() = data_dir_path + "/hints.dir";
-            cfg->view_hints_directory() = data_dir_path + "/view_hints.dir";
-            cfg->num_tokens() = 256;
-            cfg->ring_delay_ms() = 500;
-            cfg->experimental() = true;
-            cfg->shutdown_announce_in_ms() = 0;
+            cfg->commitlog_directory.set(data_dir_path + "/commitlog.dir");
+            cfg->hints_directory.set(data_dir_path + "/hints.dir");
+            cfg->view_hints_directory.set(data_dir_path + "/view_hints.dir");
+            cfg->num_tokens.set(256);
+            cfg->ring_delay_ms.set(500);
+            cfg->experimental.set(true);
+            cfg->shutdown_announce_in_ms.set(0);
+            cfg->broadcast_to_all_shards().get();
             create_directories((data_dir_path + "/system").c_str());
             create_directories(cfg->commitlog_directory().c_str());
             create_directories(cfg->hints_directory().c_str());
@@ -354,6 +360,7 @@ public:
                 create_directories((cfg->view_hints_directory() + "/" + std::to_string(i)).c_str());
             }
 
+            set_abort_on_internal_error(true);
             const gms::inet_address listen("127.0.0.1");
             auto& ms = netw::get_messaging_service();
             // don't start listening so tests can be run in parallel
@@ -378,12 +385,14 @@ public:
             auto view_update_generator = ::make_shared<seastar::sharded<db::view::view_update_generator>>();
 
             auto& ss = service::get_storage_service();
-            ss.start(std::ref(*db), std::ref(gms::get_gossiper()), std::ref(*auth_service), std::ref(sys_dist_ks), std::ref(*view_update_generator), std::ref(*feature_service), true, cfg_in.disabled_features).get();
+            service::storage_service_config sscfg;
+            sscfg.available_memory = memory::stats().total_memory();
+            ss.start(std::ref(*db), std::ref(gms::get_gossiper()), std::ref(*auth_service), std::ref(sys_dist_ks), std::ref(*view_update_generator), std::ref(*feature_service), sscfg, true, cfg_in.disabled_features).get();
             auto stop_storage_service = defer([&ss] { ss.stop().get(); });
 
             database_config dbcfg;
             dbcfg.available_memory = memory::stats().total_memory();
-            db->start(std::move(*cfg), dbcfg).get();
+            db->start(std::ref(*cfg), dbcfg).get();
             auto stop_db = defer([db] {
                 db->stop().get();
             });
@@ -528,39 +537,3 @@ future<> do_with_cql_env_thread(std::function<void(cql_test_env&)> func, cql_tes
         });
     }, std::move(cfg_in));
 }
-
-class storage_service_for_tests::impl {
-    sharded<gms::feature_service> _feature_service;
-    sharded<gms::gossiper> _gossiper;
-    distributed<database> _db;
-    db::config _cfg;
-    sharded<auth::service> _auth_service;
-    sharded<db::system_distributed_keyspace> _sys_dist_ks;
-    sharded<db::view::view_update_generator> _view_update_generator;
-public:
-    impl() {
-        auto thread = seastar::thread_impl::get();
-        assert(thread);
-        utils::fb_utilities::set_broadcast_address(gms::inet_address("localhost"));
-        utils::fb_utilities::set_broadcast_rpc_address(gms::inet_address("localhost"));
-        _feature_service.start().get();
-        _gossiper.start(std::ref(_feature_service), std::ref(_cfg)).get();
-        netw::get_messaging_service().start(gms::inet_address("127.0.0.1"), 7000, false).get();
-        service::get_storage_service().start(std::ref(_db), std::ref(_gossiper), std::ref(_auth_service), std::ref(_sys_dist_ks), std::ref(_view_update_generator), std::ref(_feature_service), true).get();
-        service::get_storage_service().invoke_on_all([] (auto& ss) {
-            ss.enable_all_features();
-        }).get();
-    }
-    ~impl() {
-        service::get_storage_service().stop().get();
-        netw::get_messaging_service().stop().get();
-        _db.stop().get();
-        _gossiper.stop().get();
-        _feature_service.stop().get();
-    }
-};
-
-storage_service_for_tests::storage_service_for_tests() : _impl(std::make_unique<impl>()) {
-}
-
-storage_service_for_tests::~storage_service_for_tests() = default;

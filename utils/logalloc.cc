@@ -43,73 +43,113 @@
 
 #include <random>
 
+#ifdef SEASTAR_ASAN_ENABLED
+#include "sanitizer/asan_interface.h"
+// For each aligned 8 byte segment, the algorithm used by address
+// sanitizer can represent any addressable prefix followd by a
+// poisoned suffix. The details are at:
+// https://github.com/google/sanitizers/wiki/AddressSanitizerAlgorithm
+// For us this means that:
+// * The descriptor must be 8 byte aligned. If it was not, making the
+//   descriptor addressable would also make the end of the previous
+//   value addressable.
+// * Each value must be at least 8 byte aligned. If it was not, making
+//   the value addressable would also make the end of the descriptor
+//   addressable.
+namespace debug {
+constexpr size_t logalloc_alignment = 8;
+}
+template<typename T>
+[[nodiscard]] static T align_up_for_asan(T val) {
+    return align_up(val, size_t(8));
+}
+template<typename T>
+void poison(const T* addr, size_t size) {
+    // Both values and descriptors must be aligned.
+    assert(uintptr_t(addr) % 8 == 0);
+    // This can be followed by
+    // * 8 byte aligned descriptor (this is a value)
+    // * 8 byte aligned value
+    // * dead value
+    // * end of segment
+    // In all cases, we can align up the size to guarantee that asan
+    // is able to poison this.
+    ASAN_POISON_MEMORY_REGION(addr, align_up_for_asan(size));
+}
+void unpoison(const char *addr, size_t size) {
+    ASAN_UNPOISON_MEMORY_REGION(addr, size);
+}
+#else
+namespace debug {
+constexpr size_t logalloc_alignment = 1;
+}
+template<typename T>
+[[nodiscard]] static T align_up_for_asan(T val) { return val; }
+template<typename T>
+void poison(const T* addr, size_t size) { }
+void unpoison(const char *addr, size_t size) { }
+#endif
+
 namespace bi = boost::intrusive;
 
 standard_allocation_strategy standard_allocation_strategy_instance;
 
 namespace {
 
+class migrators_base {
+protected:
+    std::vector<const migrate_fn_type*> _migrators;
+};
+
 #ifdef DEBUG_LSA_SANITIZER
 
-class migrators : public enable_lw_shared_from_this<migrators> {
-public:
-    static constexpr uint32_t maximum_id_value = std::numeric_limits<uint32_t>::max() / 2;
+class migrators : public migrators_base, public enable_lw_shared_from_this<migrators> {
 private:
-    struct migrator_entry {
-        const migrate_fn_type* _migrator;
+    struct backtrace_entry {
         saved_backtrace _registration;
         saved_backtrace _deregistration;
     };
-    std::unordered_map<uint32_t, migrator_entry> _migrators;
-    std::default_random_engine _random_engine { std::random_device()() };
-    std::uniform_int_distribution<uint32_t> _id_distribution { 0, maximum_id_value };
+    std::vector<std::unique_ptr<backtrace_entry>> _backtraces;
 
     static logging::logger _logger;
 private:
     void on_error() { abort(); }
 public:
     uint32_t add(const migrate_fn_type* m) {
-        while (true) {
-            auto id = _id_distribution(_random_engine);
-            if (_migrators.count(id)) {
-                continue;
-            }
-            _migrators.emplace(id, migrator_entry { m, current_backtrace(), {} });
-            return id;
-        }
+        _migrators.push_back(m);
+        _backtraces.push_back(std::make_unique<backtrace_entry>(backtrace_entry{current_backtrace(), {}}));
+        return _migrators.size() - 1;
     }
     void remove(uint32_t idx) {
-        auto it = _migrators.find(idx);
-        if (it == _migrators.end()) {
+        if (idx >= _migrators.size()) {
             _logger.error("Attempting to deregister migrator id {} which was never registered:\n{}",
                           idx, current_backtrace());
             on_error();
         }
-        if (!it->second._migrator) {
+        if (!_migrators[idx]) {
             _logger.error("Attempting to double deregister migrator id {}:\n{}\n"
                           "Previously deregistered at:\n{}\nRegistered at:\n{}",
-                          idx, current_backtrace(), it->second._deregistration,
-                          it->second._registration);
+                          idx, current_backtrace(), _backtraces[idx]->_deregistration,
+                          _backtraces[idx]->_registration);
             on_error();
         }
-        it->second._migrator = nullptr;
-        it->second._deregistration = current_backtrace();
+        _migrators[idx] = nullptr;
+        _backtraces[idx]->_deregistration = current_backtrace();
     }
     const migrate_fn_type*& operator[](uint32_t idx) {
-        auto it = _migrators.find(idx);
-        if (it == _migrators.end()) {
+        if (idx >= _migrators.size()) {
             _logger.error("Attempting to use migrator id {} that was never registered:\n{}",
                           idx, current_backtrace());
             on_error();
         }
-        if (!it->second._migrator) {
+        if (!_migrators[idx]) {
             _logger.error("Attempting to use deregistered migrator id {}:\n{}\n"
                           "Deregistered at:\n{}\nRegistered at:\n{}",
-                          idx, current_backtrace(), it->second._deregistration,
-                          it->second._registration);
+                          idx, current_backtrace(), _backtraces[idx]->_deregistration,
+                          _backtraces[idx]->_registration);
             on_error();
         }
-        return it->second._migrator;
+        return _migrators[idx];
     }
 };
 
@@ -117,12 +157,10 @@ logging::logger migrators::_logger("lsa-migrator-sanitizer");
 
 #else
 
-class migrators : public enable_lw_shared_from_this<migrators> {
-    std::vector<const migrate_fn_type*> _migrators;
+class migrators : public migrators_base, public enable_lw_shared_from_this<migrators> {
     std::deque<uint32_t> _unused_ids;
-public:
-    static constexpr uint32_t maximum_id_value = std::numeric_limits<uint32_t>::max() / 2;
 
+public:
     uint32_t add(const migrate_fn_type* m) {
         if (!_unused_ids.empty()) {
             auto idx = _unused_ids.front();
@@ -370,7 +408,7 @@ public:
 
 tracker::tracker()
     : _impl(std::make_unique<impl>())
-    , _reclaimer([this] { return reclaim(); }, memory::reclaimer_scope::sync)
+    , _reclaimer([this] (seastar::memory::reclaimer::request r) { return reclaim(r); }, memory::reclaimer_scope::sync)
 { }
 
 tracker::~tracker() {
@@ -755,6 +793,7 @@ segment* segment_pool::allocate_segment(size_t reserve)
                 continue;
             }
             auto seg = new (p) segment;
+            poison(seg, sizeof(segment));
             auto idx = _store.new_idx_for_segment(seg);
             _lsa_owned_segments_bitmap.set(idx);
             return seg;
@@ -954,9 +993,6 @@ class region_impl final : public basic_region_impl {
     private:
         explicit object_descriptor(uint32_t n) : _n(n) {}
     public:
-        static_assert(migrators::maximum_id_value <= std::numeric_limits<uint32_t>::max()
-            && uint64_t(migrators::maximum_id_value) * 2 + 1 <= std::numeric_limits<uint32_t>::max());
-
         object_descriptor(allocation_strategy::migrate_fn migrator)
                 : _n(migrator->index() * 2 + 1)
         { }
@@ -994,21 +1030,26 @@ class region_impl final : public basic_region_impl {
         void encode(char*& pos) const {
             uint64_t b = 64;
             auto n = _n;
+            auto start = pos;
             do {
                 b |= n & 63;
                 n >>= 6;
                 if (!n) {
                     b |= 128;
                 }
+                unpoison(pos, 1);
                 *pos++ = b;
                 b = 0;
             } while (n);
+            poison(start, pos - start);
         }
 
         // non-canonical encoding to allow padding (for alignment); encoded_size must be
         // sufficient (greater than this->encoded_size())
         void encode(char*& pos, size_t encoded_size) const {
             uint64_t b = 64;
+            auto start = pos;
+            unpoison(start, encoded_size);
             auto n = _n;
             do {
                 b |= n & 63;
@@ -1019,6 +1060,7 @@ class region_impl final : public basic_region_impl {
                 *pos++ = b;
                 b = 0;
             } while (encoded_size);
+            poison(start, pos - start);
         }
 
         static object_descriptor decode_forwards(const char*& pos) {
@@ -1027,6 +1069,7 @@ class region_impl final : public basic_region_impl {
             auto p = pos; // avoid aliasing; p++ doesn't touch memory
             uint8_t b;
             do {
+                unpoison(p, 1);
                 b = *p++;
                 if (shift < 32) {
                     // non-canonical encoding can cause large shift; undefined in C++
@@ -1034,6 +1077,7 @@ class region_impl final : public basic_region_impl {
                 }
                 shift += 6;
             } while ((b & 128) == 0);
+            poison(pos, p - pos);
             pos = p;
             return object_descriptor(n);
         }
@@ -1043,9 +1087,12 @@ class region_impl final : public basic_region_impl {
             uint8_t b;
             auto p = pos; // avoid aliasing; --p doesn't touch memory
             do {
-                b = *--p;
+                --p;
+                unpoison(p, 1);
+                b = *p;
                 n = (n << 6) | (b & 63);
             } while ((b & 64) == 0);
+            poison(p, pos - p);
             pos = p;
             return object_descriptor(n);
         }
@@ -1111,7 +1158,7 @@ private:
         auto desc = object_descriptor(migrator);
         auto desc_encoded_size = desc.encoded_size();
 
-        size_t obj_offset = align_up(_active_offset + desc_encoded_size, alignment);
+        size_t obj_offset = align_up_for_asan(align_up(_active_offset + desc_encoded_size, alignment));
         if (obj_offset + size > segment::size) {
             close_and_open();
             return alloc_small(migrator, size, alignment);
@@ -1121,7 +1168,11 @@ private:
         auto pos = _active->at<char>(_active_offset);
         // Use non-canonical encoding to allow for alignment pad
         desc.encode(pos, obj_offset - _active_offset);
+        unpoison(pos, size);
         _active_offset = obj_offset + size;
+
+        // Align the end of the value so that the next descriptor is aligned
+        _active_offset = align_up_for_asan(_active_offset);
         _active->record_alloc(_active_offset - old_active_offset);
         return pos;
     }
@@ -1132,7 +1183,7 @@ private:
 
         static_assert(std::is_same<void, std::result_of_t<Func(const object_descriptor*, void*)>>::value, "bad Func signature");
 
-        auto pos = seg->at<const char>(0);
+        auto pos = align_up_for_asan(seg->at<const char>(0));
         while (pos < seg->at<const char>(segment::size)) {
             auto old_pos = pos;
             const auto desc = object_descriptor::decode_forwards(pos);
@@ -1143,6 +1194,7 @@ private:
             } else {
                 pos = old_pos + desc.dead_size();
             }
+            pos = align_up_for_asan(pos);
         }
     }
 
@@ -1382,10 +1434,11 @@ public:
         auto pos = reinterpret_cast<const char*>(obj);
         auto old_pos = pos;
         auto desc = object_descriptor::decode_backwards(pos);
-        auto dead_size = size + (old_pos - pos);
+        auto dead_size = align_up_for_asan(size + (old_pos - pos));
         desc = object_descriptor::make_dead(dead_size);
         auto npos = const_cast<char*>(pos);
         desc.encode(npos);
+        poison(pos, dead_size);
 
         if (seg != _active) {
             _closed_occupancy -= seg->occupancy();
@@ -1507,16 +1560,20 @@ public:
             auto old_pos = pos;
             auto desc = object_descriptor::decode_forwards(pos);
             // Keep same size as before to maintain alignment
-            desc.encode(dpos, pos - old_pos);
+            size_t pad = pos - old_pos;
+            desc.encode(dpos, pad);
             if (desc.is_live()) {
-                offset += pos - old_pos;
+                offset += pad;
                 auto size = desc.live_size(pos);
                 offset += size;
                 _sanitizer.on_migrate(pos, size, dpos);
+                unpoison(dpos, size);
                 desc.migrator()->migrate(const_cast<char*>(pos), dpos, size);
+                poison(old_pos, size + pad);
             } else {
                 offset += desc.dead_size();
             }
+            offset = align_up_for_asan(offset);
         }
         shard_segment_pool.on_segment_migration();
     }
@@ -1618,8 +1675,8 @@ bool tracker::should_abort_on_bad_alloc() {
     return _impl->should_abort_on_bad_alloc();
 }
 
-memory::reclaiming_result tracker::reclaim() {
-    return reclaim(_impl->reclamation_step() * segment::size)
+memory::reclaiming_result tracker::reclaim(seastar::memory::reclaimer::request r) {
+    return reclaim(std::max(r.bytes_to_reclaim, _impl->reclamation_step() * segment::size))
            ? memory::reclaiming_result::reclaimed_something
            : memory::reclaiming_result::reclaimed_nothing;
 }

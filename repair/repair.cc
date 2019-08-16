@@ -69,6 +69,8 @@ std::ostream& operator<<(std::ostream& out, row_level_diff_detect_algorithm algo
     switch (algo) {
     case row_level_diff_detect_algorithm::send_full_set:
         return out << "send_full_set";
+    case row_level_diff_detect_algorithm::send_full_set_rpc_stream:
+        return out << "send_full_set_rpc_stream";
     };
     return out << "unknown";
 }
@@ -205,124 +207,126 @@ static std::vector<gms::inet_address> get_neighbors(database& db,
 #endif
 }
 
-// The repair_tracker tracks ongoing repair operations and their progress.
-// A repair which has already finished successfully is dropped from this
-// table, but a failed repair will remain in the table forever so it can
-// be queried about more than once (FIXME: reconsider this. But note that
-// failed repairs should be rare anwyay).
-// This object is not thread safe, and must be used by only one cpu.
-class tracker {
-private:
-    // Each repair_start() call returns a unique int which the user can later
-    // use to follow the status of this repair with repair_status().
-    // We can't use the number 0 - if repair_start() returns 0, it means it
-    // decide quickly that there is nothing to repair.
-    int _next_repair_command = 1;
-    // Note that there are no "SUCCESSFUL" entries in the "status" map:
-    // Successfully-finished repairs are those with id < _next_repair_command
-    // but aren't listed as running or failed the status map.
-    std::unordered_map<int, repair_status> _status;
-    // Used to allow shutting down repairs in progress, and waiting for them.
-    seastar::gate _gate;
-    // Set when the repair service is being shutdown
-    std::atomic_bool _shutdown alignas(seastar::cache_line_size);
-    // Map repair id into repair_info. The vector has smp::count elements, each
-    // element will be accessed by only one shard.
-    std::vector<std::unordered_map<int, lw_shared_ptr<repair_info>>> _repairs;
-public:
-    tracker() : _shutdown(false) {
+static tracker* _the_tracker = nullptr;
+
+tracker& repair_tracker() {
+    if (_the_tracker) {
+        return *_the_tracker;
+    } else {
+        throw std::runtime_error("The repair tracker is not initialized yet");
     }
-    void start(int id) {
-        _gate.enter();
-        _status[id] = repair_status::RUNNING;
+}
+
+tracker::tracker(size_t nr_shards, size_t max_repair_memory)
+    : _shutdown(false)
+    , _repairs(nr_shards) {
+    auto nr = std::max(size_t(1), size_t(max_repair_memory / max_repair_memory_per_range()));
+    rlogger.info("Setting max_repair_memory={}, max_repair_memory_per_range={}, max_repair_ranges_in_parallel={}",
+        max_repair_memory, max_repair_memory_per_range(), nr);
+    _range_parallelism_semaphores.reserve(nr_shards);
+    while (nr_shards--) {
+        _range_parallelism_semaphores.emplace_back(semaphore(nr));
     }
-    void done(int id, bool succeeded) {
-        if (succeeded) {
-            _status.erase(id);
-        } else {
-            _status[id] = repair_status::FAILED;
-        }
-        _gate.leave();
+    _the_tracker = this;
+}
+
+tracker::~tracker() {
+    _the_tracker = nullptr;
+}
+
+void tracker::start(int id) {
+    _gate.enter();
+    _status[id] = repair_status::RUNNING;
+}
+
+void tracker::done(int id, bool succeeded) {
+    if (succeeded) {
+        _status.erase(id);
+    } else {
+        _status[id] = repair_status::FAILED;
     }
-    repair_status get(int id) {
-        if (id >= _next_repair_command) {
-            throw std::runtime_error(format("unknown repair id {:d}", id));
-        }
-        auto it = _status.find(id);
-        if (it == _status.end()) {
-            return repair_status::SUCCESSFUL;
-        } else {
-            return it->second;
-        }
+    _gate.leave();
+}
+repair_status tracker::get(int id) {
+    if (id >= _next_repair_command) {
+        throw std::runtime_error(format("unknown repair id {:d}", id));
     }
-    int next_repair_command() {
-        return _next_repair_command++;
+    auto it = _status.find(id);
+    if (it == _status.end()) {
+        return repair_status::SUCCESSFUL;
+    } else {
+        return it->second;
     }
-    future<> shutdown() {
-        _shutdown.store(true, std::memory_order_relaxed);
-        return _gate.close();
+}
+
+int tracker::next_repair_command() {
+    return _next_repair_command++;
+}
+
+future<> tracker::shutdown() {
+    _shutdown.store(true, std::memory_order_relaxed);
+    return _gate.close();
+}
+
+void tracker::check_in_shutdown() {
+    if (_shutdown.load(std::memory_order_relaxed)) {
+        throw std::runtime_error(format("Repair service is being shutdown"));
     }
-    void check_in_shutdown() {
-        if (_shutdown.load(std::memory_order_relaxed)) {
-            throw std::runtime_error(format("Repair service is being shutdown"));
-        }
+}
+
+void tracker::add_repair_info(int id, lw_shared_ptr<repair_info> ri) {
+    _repairs[engine().cpu_id()].emplace(id, ri);
+}
+
+void tracker::remove_repair_info(int id) {
+    _repairs[engine().cpu_id()].erase(id);
+}
+
+lw_shared_ptr<repair_info> tracker::get_repair_info(int id) {
+    auto it = _repairs[engine().cpu_id()].find(id);
+    if (it != _repairs[engine().cpu_id()].end()) {
+        return it->second;
     }
-    void init_repair_info() {
-        if (_repairs.size() != smp::count) {
-            _repairs.resize(smp::count);
-        }
-    }
-    void add_repair_info(int id, lw_shared_ptr<repair_info> ri) {
-        init_repair_info();
-        _repairs[engine().cpu_id()].emplace(id, ri);
-    }
-    void remove_repair_info(int id) {
-        init_repair_info();
-        _repairs[engine().cpu_id()].erase(id);
-    }
-    lw_shared_ptr<repair_info> get_repair_info(int id) {
-        init_repair_info();
-        auto it = _repairs[engine().cpu_id()].find(id);
-        if (it != _repairs[engine().cpu_id()].end()) {
-            return it->second;
-        }
-        return {};
-    }
-    std::vector<int> get_active() const {
-        std::vector<int> res;
-        boost::push_back(res, _status | boost::adaptors::filtered([] (auto& x) {
-            return x.second == repair_status::RUNNING;
-        }) | boost::adaptors::map_keys);
-        return res;
-    }
-    size_t nr_running_repair_jobs() {
-        size_t count = 0;
-        if (engine().cpu_id() != 0) {
-            return count;
-        }
-        for (auto& x : _status) {
-            auto& status = x.second;
-            if (status == repair_status::RUNNING) {
-                count++;
-            }
-        }
+    return {};
+}
+
+std::vector<int> tracker::get_active() const {
+    std::vector<int> res;
+    boost::push_back(res, _status | boost::adaptors::filtered([] (auto& x) {
+        return x.second == repair_status::RUNNING;
+    }) | boost::adaptors::map_keys);
+    return res;
+}
+
+size_t tracker::nr_running_repair_jobs() {
+    size_t count = 0;
+    if (engine().cpu_id() != 0) {
         return count;
     }
-    void abort_all_repairs() {
-        init_repair_info();
-        size_t count = nr_running_repair_jobs();
-        for (auto& x : _repairs[engine().cpu_id()]) {
-            auto& ri = x.second;
-            ri->abort();
+    for (auto& x : _status) {
+        auto& status = x.second;
+        if (status == repair_status::RUNNING) {
+            count++;
         }
-        rlogger.info0("Aborted {} repair job(s)", count);
     }
-};
+    return count;
+}
 
-static tracker repair_tracker;
+void tracker::abort_all_repairs() {
+    size_t count = nr_running_repair_jobs();
+    for (auto& x : _repairs[engine().cpu_id()]) {
+        auto& ri = x.second;
+        ri->abort();
+    }
+    rlogger.info0("Aborted {} repair job(s)", count);
+}
+
+semaphore& tracker::range_parallelism_semaphore() {
+    return _range_parallelism_semaphores[engine().cpu_id()];
+}
 
 void check_in_shutdown() {
-    repair_tracker.check_in_shutdown();
+    repair_tracker().check_in_shutdown();
 }
 
 class partition_hasher {
@@ -686,13 +690,13 @@ future<> repair_info::do_streaming() {
 }
 
 void repair_info::check_failed_ranges() {
-    rlogger.info("repair {} on shard {} stats: ranges_nr={}, sub_ranges_nr={}, {}",
+    rlogger.info("repair id {} on shard {} stats: ranges_nr={}, sub_ranges_nr={}, {}",
         id, shard, ranges.size(), _sub_ranges_nr, _stats.get_stats());
     if (nr_failed_ranges) {
-        rlogger.info("repair {} on shard {} failed - {} ranges failed", id, shard, nr_failed_ranges);
+        rlogger.info("repair id {} on shard {} failed - {} ranges failed", id, shard, nr_failed_ranges);
         throw std::runtime_error(format("repair {:d} on shard {:d} failed to do checksum for {:d} sub ranges", id, shard, nr_failed_ranges));
     } else {
-        rlogger.info("repair {} on shard {} completed successfully", id, shard);
+        rlogger.info("repair id {} on shard {} completed successfully", id, shard);
     }
 }
 
@@ -940,8 +944,20 @@ static future<> repair_cf_range(repair_info& ri,
 // Comparable to RepairSession in Origin
 static future<> repair_range(repair_info& ri, const dht::token_range& range) {
     auto id = utils::UUID_gen::get_time_UUID();
-    return do_with(get_neighbors(ri.db.local(), ri.keyspace, range, ri.data_centers, ri.hosts), [&ri, range, id] (const auto& neighbors) {
-        rlogger.debug("[repair #{}] new session: will sync {} on range {} for {}.{}", id, neighbors, range, ri.keyspace, ri.cfs);
+    return do_with(get_neighbors(ri.db.local(), ri.keyspace, range, ri.data_centers, ri.hosts), [&ri, range, id] (std::vector<gms::inet_address>& neighbors) {
+      auto live_neighbors = boost::copy_range<std::vector<gms::inet_address>>(neighbors |
+                    boost::adaptors::filtered([] (const gms::inet_address& node) { return gms::get_local_gossiper().is_alive(node); }));
+      if (live_neighbors.size() != neighbors.size()) {
+            ri.nr_failed_ranges++;
+            auto status = live_neighbors.empty() ? "skipped" : "partial";
+            rlogger.warn("Repair {} out of {} ranges, id={}, shard={}, keyspace={}, table={}, range={}, peers={}, live_peers={}, status={}",
+            ri.ranges_index, ri.ranges.size(), ri.id, ri.shard, ri.keyspace, ri.cfs, range, neighbors, live_neighbors, status);
+            if (live_neighbors.empty()) {
+                return make_ready_future<>();
+            }
+            neighbors.swap(live_neighbors);
+      }
+      return ::service::get_local_migration_manager().sync_schema(ri.db.local(), neighbors).then([&neighbors, &ri, range, id] {
         return do_for_each(ri.cfs.begin(), ri.cfs.end(), [&ri, &neighbors, range] (auto&& cf) {
             ri._sub_ranges_nr++;
             if (ri.row_level_repair()) {
@@ -950,6 +966,7 @@ static future<> repair_range(repair_info& ri, const dht::token_range& range) {
                 return repair_cf_range(ri, cf, range, neighbors);
             }
         });
+      });
     });
 }
 
@@ -1228,13 +1245,11 @@ private:
 };
 
 
-static thread_local semaphore ranges_parallelism_semaphore(16);
-
 static future<> do_repair_ranges(lw_shared_ptr<repair_info> ri) {
     if (ri->row_level_repair()) {
         // repair all the ranges in limited parallelism
         return parallel_for_each(ri->ranges, [ri] (auto&& range) {
-            return with_semaphore(ranges_parallelism_semaphore, 1, [ri, &range] {
+            return with_semaphore(repair_tracker().range_parallelism_semaphore(), 1, [ri, &range] {
                 check_in_shutdown();
                 ri->check_in_abort();
                 ri->ranges_index++;
@@ -1278,14 +1293,14 @@ static future<> do_repair_ranges(lw_shared_ptr<repair_info> ri) {
 // is assumed to be a indivisible in the sense that all the tokens in has the
 // same nodes as replicas.
 static future<> repair_ranges(lw_shared_ptr<repair_info> ri) {
-    repair_tracker.add_repair_info(ri->id, ri);
+    repair_tracker().add_repair_info(ri->id, ri);
     return do_repair_ranges(ri).then([ri] {
         ri->check_failed_ranges();
-        repair_tracker.remove_repair_info(ri->id);
+        repair_tracker().remove_repair_info(ri->id);
         return make_ready_future<>();
     }).handle_exception([ri] (std::exception_ptr eptr) {
-        rlogger.info("repair {} failed - {}", ri->id, eptr);
-        repair_tracker.remove_repair_info(ri->id);
+        rlogger.info("repair id {} failed - {}", ri->id, eptr);
+        repair_tracker().remove_repair_info(ri->id);
         return make_exception_future<>(std::move(eptr));
     });
 }
@@ -1305,10 +1320,10 @@ static int do_repair_start(seastar::sharded<database>& db, sstring keyspace,
     // nothing to repair, and return 0. "nodetool repair" prints in this case
     // that "Nothing to repair for keyspace '...'". We don't have such a case
     // yet. Real ids returned by next_repair_command() will be >= 1.
-    int id = repair_tracker.next_repair_command();
+    int id = repair_tracker().next_repair_command();
     rlogger.info("starting user-requested repair for keyspace {}, repair id {}, options {}", keyspace, id, options_map);
-    repair_tracker.start(id);
-    auto fail = defer([id] { repair_tracker.done(id, false); });
+    repair_tracker().start(id);
+    auto fail = defer([id] { repair_tracker().done(id, false); });
 
     if (!gms::get_local_gossiper().is_normal(utils::fb_utilities::get_broadcast_address())) {
         throw std::runtime_error("Node is not in NORMAL status yet!");
@@ -1402,7 +1417,7 @@ static int do_repair_start(seastar::sharded<database>& db, sstring keyspace,
             rlogger.info("repair {} failed", id);
         } else {
             fail.cancel();
-            repair_tracker.done(id, true);
+            repair_tracker().done(id, true);
             rlogger.info("repair {} completed successfully", id);
         }
         for (auto& f : results) {
@@ -1425,20 +1440,20 @@ future<int> repair_start(seastar::sharded<database>& db, sstring keyspace,
 
 future<std::vector<int>> get_active_repairs(seastar::sharded<database>& db) {
     return db.invoke_on(0, [] (database& localdb) {
-        return repair_tracker.get_active();
+        return repair_tracker().get_active();
     });
 }
 
 future<repair_status> repair_get_status(seastar::sharded<database>& db, int id) {
     return db.invoke_on(0, [id] (database& localdb) {
-        return repair_tracker.get(id);
+        return repair_tracker().get(id);
     });
 }
 
 future<> repair_shutdown(seastar::sharded<database>& db) {
     rlogger.info("Starting shutdown of repair");
     return db.invoke_on(0, [] (database& localdb) {
-        return repair_tracker.shutdown().then([] {
+        return repair_tracker().shutdown().then([] {
             return shutdown_all_row_level_repair();
         }).then([] {
             rlogger.info("Completed shutdown of repair");
@@ -1448,6 +1463,6 @@ future<> repair_shutdown(seastar::sharded<database>& db) {
 
 future<> repair_abort_all(seastar::sharded<database>& db) {
     return db.invoke_on_all([] (database& localdb) {
-        repair_tracker.abort_all_repairs();
+        repair_tracker().abort_all_repairs();
     });
 }

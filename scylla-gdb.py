@@ -889,6 +889,25 @@ class scylla_memory(gdb.Command):
                           str_real_dirty=dirty_mem_mgr(db['_streaming_dirty_memory_manager']).real_dirty(),
                           str_virt_dirty=dirty_mem_mgr(db['_streaming_dirty_memory_manager']).virt_dirty()))
 
+        sp = sharded(gdb.parse_and_eval('service::_the_storage_proxy')).local()
+        hm = std_optional(sp['_hints_manager']).get()
+        view_hm = sp['_hints_for_views_manager']
+
+        gdb.write('Coordinator:\n'
+          '  fg writes:  {fg_wr:>13}\n'
+          '  bg writes:  {bg_wr:>13}, {bg_wr_bytes:>} B\n'
+          '  fg reads:   {fg_rd:>13}\n'
+          '  bg reads:   {bg_rd:>13}\n'
+          '  hints:      {regular:>13} B\n'
+          '  view hints: {views:>13} B\n\n'
+          .format(fg_wr=int(sp['_stats']['writes']) - int(sp['_stats']['background_writes']),
+                  bg_wr=int(sp['_stats']['background_writes']),
+                  bg_wr_bytes=int(sp['_stats']['background_write_bytes']),
+                  fg_rd=int(sp['_stats']['foreground_reads']),
+                  bg_rd=int(sp['_stats']['reads']) - int(sp['_stats']['foreground_reads']),
+                  regular=int(hm['_stats']['size_of_hints_in_progress']),
+                  views=int(view_hm['_stats']['size_of_hints_in_progress'])))
+
         gdb.write('Small pools:\n')
         small_pools = cpu_mem['small_pools']
         nr = small_pools['nr_small_pools']
@@ -1309,7 +1328,7 @@ class scylla_ptr(gdb.Command):
             ptr_meta.offset_in_object = ptr - span.start
 
         # FIXME: handle debug-mode build
-        index = gdb.parse_and_eval('(%d - \'logalloc::shard_segment_pool\'._segments_base) / \'logalloc::segment\'::size' % (ptr))
+        index = gdb.parse_and_eval('(%d - \'logalloc::shard_segment_pool\'._store._segments_base) / \'logalloc::segment\'::size' % (ptr))
         desc = gdb.parse_and_eval('\'logalloc::shard_segment_pool\'._segments._M_impl._M_start[%d]' % (index))
         ptr_meta.is_lsa = bool(desc['_region'])
 
@@ -1328,7 +1347,7 @@ class scylla_segment_descs(gdb.Command):
 
     def invoke(self, arg, from_tty):
         # FIXME: handle debug-mode build
-        base = int(gdb.parse_and_eval('\'logalloc\'::shard_segment_pool._segments_base'))
+        base = int(gdb.parse_and_eval('\'logalloc\'::shard_segment_pool._store._segments_base'))
         segment_size = int(gdb.parse_and_eval('\'logalloc\'::segment::size'))
         addr = base
         for desc in std_vector(gdb.parse_and_eval('\'logalloc\'::shard_segment_pool._segments')):
@@ -1370,10 +1389,10 @@ class scylla_lsa(gdb.Command):
         region = regions['_M_impl']['_M_start']
         gdb.write('LSA regions:\n')
         while region != regions['_M_impl']['_M_finish']:
-            gdb.write('    Region #{r_id}\n      - reclaimable: {r_en:>14}\n'
+            gdb.write('    Region #{r_id} (logalloc::region_impl*) 0x{r_addr}\n      - reclaimable: {r_en:>14}\n'
                       '      - evictable: {r_ev:16}\n      - non-LSA memory: {r_non_lsa:>11}\n'
                       '      - closed LSA memory: {r_lsa:>8}\n      - unused memory: {r_unused:>12}\n'
-                      .format(r_id=int(region['_id']), r_en=bool(region['_reclaiming_enabled']),
+                      .format(r_addr=str(region.dereference()), r_id=int(region['_id']), r_en=bool(region['_reclaiming_enabled']),
                               r_ev=bool(region['_evictable']),
                               r_non_lsa=int(region['_non_lsa_occupancy']['_total_space']),
                               r_lsa=int(region['_closed_occupancy']['_total_space']),
@@ -1483,6 +1502,10 @@ class scylla_lsa_segment(gdb.Command):
 
     def invoke(self, arg, from_tty):
         # See logalloc::region_impl::for_each_live()
+
+        logalloc_alignment = gdb.parse_and_eval("'::debug::logalloc_alignment'")
+        logalloc_alignment_mask = logalloc_alignment - 1
+
         ptr = int(arg, 0)
         seg = gdb.parse_and_eval('(char*)(%d & ~(\'logalloc\'::segment::size - 1))' % (ptr))
         segment_size = int(gdb.parse_and_eval('\'logalloc\'::segment::size'))
@@ -1491,6 +1514,7 @@ class scylla_lsa_segment(gdb.Command):
             desc = lsa_object_descriptor.decode(seg)
             print(desc)
             seg = desc.end_pos()
+            seg = gdb.parse_and_eval('(char*)((%d + %d) & ~%d)' % (seg, logalloc_alignment_mask, logalloc_alignment_mask))
 
 
 class scylla_timers(gdb.Command):

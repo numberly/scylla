@@ -62,6 +62,7 @@
 #include "disk-error-handler.hh"
 #include "gms/feature.hh"
 #include <seastar/core/metrics_registration.hh>
+#include <seastar/core/rwlock.hh>
 #include "sstables/version.hh"
 
 namespace cql_transport {
@@ -109,6 +110,10 @@ public:
         , _format(format)
     { }
     void on_enabled() override;
+};
+
+struct storage_service_config {
+    size_t available_memory;
 };
 
 /**
@@ -161,8 +166,10 @@ private:
     bool _stream_manager_stopped = false;
     seastar::metrics::metric_groups _metrics;
     std::set<sstring> _disabled_features;
+    size_t _service_memory_total;
+    semaphore _service_memory_limiter;
 public:
-    storage_service(distributed<database>& db, gms::gossiper& gossiper, sharded<auth::service>&, sharded<db::system_distributed_keyspace>&, sharded<db::view::view_update_generator>&, gms::feature_service& feature_service, /* only for tests */ bool for_testing = false, /* only for tests */ std::set<sstring> disabled_features = {});
+    storage_service(distributed<database>& db, gms::gossiper& gossiper, sharded<auth::service>&, sharded<db::system_distributed_keyspace>&, sharded<db::view::view_update_generator>&, gms::feature_service& feature_service, storage_service_config config, /* only for tests */ bool for_testing = false, /* only for tests */ std::set<sstring> disabled_features = {});
     void isolate_on_error();
     void isolate_on_commit_error();
 
@@ -261,6 +268,13 @@ private:
 
     bool _joined = false;
 
+    seastar::rwlock _snapshot_lock;
+
+    template <typename Func>
+    static std::result_of_t<Func()> run_snapshot_modify_operation(Func&&);
+
+    template <typename Func>
+    static std::result_of_t<Func()> run_snapshot_list_operation(Func&&);
 public:
     enum class mode { STARTING, NORMAL, JOINING, LEAVING, DECOMMISSIONED, MOVING, DRAINING, DRAINED };
 private:
@@ -324,6 +338,7 @@ private:
     gms::feature _unbounded_range_tombstones_feature;
     gms::feature _view_virtual_columns;
     gms::feature _digest_insensitive_to_expiry;
+    gms::feature _computed_columns;
 
     sstables::sstable_version_types _sstables_format = sstables::sstable_version_types::ka;
     seastar::semaphore _feature_listeners_sem = {1};
@@ -2336,14 +2351,21 @@ public:
     bool cluster_supports_unbounded_range_tombstones() const {
         return bool(_unbounded_range_tombstones_feature);
     }
+
     const gms::feature& cluster_supports_view_virtual_columns() const {
         return _view_virtual_columns;
     }
     const gms::feature& cluster_supports_digest_insensitive_to_expiry() const {
         return _digest_insensitive_to_expiry;
     }
+
+    bool cluster_supports_computed_columns() const {
+        return bool(_computed_columns);
+    }
+
     // Returns schema features which all nodes in the cluster advertise as supported.
     db::schema_features cluster_schema_features() const;
+
 private:
     future<> set_cql_ready(bool ready);
 private:
@@ -2355,7 +2377,7 @@ private:
 };
 
 future<> init_storage_service(distributed<database>& db, sharded<gms::gossiper>& gossiper, sharded<auth::service>& auth_service, sharded<db::system_distributed_keyspace>& sys_dist_ks,
-        sharded<db::view::view_update_generator>& view_update_generator, sharded<gms::feature_service>& feature_service);
+        sharded<db::view::view_update_generator>& view_update_generator, sharded<gms::feature_service>& feature_service, storage_service_config config);
 future<> deinit_storage_service();
 
 future<> read_sstables_format(distributed<storage_service>& ss);

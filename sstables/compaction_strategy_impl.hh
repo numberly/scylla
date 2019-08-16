@@ -86,7 +86,7 @@ public:
         return _use_clustering_key_filter;
     }
 
-    virtual bool ignore_partial_runs() const {
+    virtual bool can_compact_partial_runs() const {
         return false;
     }
 
@@ -95,5 +95,9 @@ public:
     bool worth_dropping_tombstones(const shared_sstable& sst, gc_clock::time_point gc_before);
 
     virtual compaction_backlog_tracker& get_backlog_tracker() = 0;
+
+    virtual uint64_t adjust_partition_estimate(const mutation_source_metadata& ms_meta, uint64_t partition_estimate);
+
+    virtual reader_consumer make_interposer_consumer(const mutation_source_metadata& ms_meta, reader_consumer end_consumer);
 };
 }

@@ -2,7 +2,6 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/util/log.hh>
 #include "lister.hh"
-#include "disk-error-handler.hh"
 #include "checked-file-impl.hh"
 
 static seastar::logger llogger("lister");
@@ -42,7 +41,7 @@ future<directory_entry> lister::guarantee_type(directory_entry de) {
     if (de.type) {
         return make_ready_future<directory_entry>(std::move(de));
     } else {
-        auto f = engine().file_type((_dir / de.name.c_str()).native());
+        auto f = engine().file_type((_dir / de.name.c_str()).native(), follow_symlink::no);
         return f.then([dir = _dir, de = std::move(de)] (std::optional<directory_entry_type> t) mutable {
             // If some FS error occures - return an exceptional future
             if (!t) {
@@ -69,10 +68,10 @@ future<> lister::rmdir(fs::path dir) {
         if (de.type.value() == directory_entry_type::directory) {
             return rmdir(std::move(current_entry_path));
         } else {
-            return io_check(remove_file, current_entry_path.native());
+            return remove_file(current_entry_path.native());
         }
     }).then([dir] {
         // ...then kill the directory itself
-        return io_check(remove_file, dir.native());
+        return remove_file(dir.native());
     });
 }

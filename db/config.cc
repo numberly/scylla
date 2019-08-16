@@ -169,7 +169,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "If set to higher than 0, ignore the controller's output and set the memtable shares statically. Do not set this unless you know what you are doing and suspect a problem in the controller. This option will be retired when the controller reaches more maturity")
     , compaction_static_shares(this, "compaction_static_shares", value_status::Used, 0,
         "If set to higher than 0, ignore the controller's output and set the compaction shares statically. Do not set this unless you know what you are doing and suspect a problem in the controller. This option will be retired when the controller reaches more maturity")
-    , compaction_enforce_min_threshold(this, "compaction_enforce_min_threshold", value_status::Used, false,
+    , compaction_enforce_min_threshold(this, "compaction_enforce_min_threshold", liveness::LiveUpdate, value_status::Used, false,
         "If set to true, enforce the min_threshold option for compactions strictly. If false (default), Scylla may decide to compact even if below min_threshold")
     /* Initialization properties */
     /* The minimal properties needed for configuring a cluster. */
@@ -184,6 +184,12 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "Never specify 0.0.0.0; it is always wrong.")
     , listen_interface(this, "listen_interface", value_status::Unused, "eth0",
         "The interface that Scylla binds to for connecting to other Scylla nodes. Interfaces must correspond to a single address, IP aliasing is not supported. See listen_address.")
+    , listen_interface_prefer_ipv6(this, "listen_interface_prefer_ipv6", value_status::Used, false,
+        "If you choose to specify the interface by name and the interface has an ipv4 and an ipv6 address\n"
+        "you can specify which should be chosen using listen_interface_prefer_ipv6. If false the first ipv4\n"
+        "address will be used. If true the first ipv6 address will be used. Defaults to false preferring\n"
+        "ipv4. If there is only one address it will be selected regardless of ipv4/ipv6."
+    )
     /* Default directories */
     /* If you have changed any of the default directories during installation, make sure you have root access and set these properties: */
     , commitlog_directory(this, "commitlog_directory", value_status::Used, "/var/lib/scylla/commitlog",
@@ -241,6 +247,12 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "Related information: Network\n")
     , rpc_interface(this, "rpc_interface", value_status::Unused, "eth1",
         "The listen address for client connections. Interfaces must correspond to a single address, IP aliasing is not supported. See rpc_address.")
+    , rpc_interface_prefer_ipv6(this, "rpc_interface_prefer_ipv6", value_status::Used, false,
+        "If you choose to specify the interface by name and the interface has an ipv4 and an ipv6 address\n"
+        "you can specify which should be chosen using rpc_interface_prefer_ipv6. If false the first ipv4\n"
+        "address will be used. If true the first ipv6 address will be used. Defaults to false preferring\n"
+        "ipv4. If there is only one address it will be selected regardless of ipv4/ipv6"
+    )
     , seed_provider(this, "seed_provider", value_status::Used, seed_provider_type("org.apache.cassandra.locator.SimpleSeedProvider"),
         "The addresses of hosts deemed contact points. Scylla nodes use the -seeds list to find each other and learn the topology of the ring.\n"
         "\n"
@@ -635,7 +647,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , api_address(this, "api_address", value_status::Used, "", "Http Rest API address")
     , api_ui_dir(this, "api_ui_dir", value_status::Used, "swagger-ui/dist/", "The directory location of the API GUI")
     , api_doc_dir(this, "api_doc_dir", value_status::Used, "api/api-doc/", "The API definition file directory")
-    , load_balance(this, "load_balance", value_status::Used, "none", "CQL request load balancing: 'none' or round-robin'")
+    , load_balance(this, "load_balance", value_status::Unused, "none", "CQL request load balancing: 'none' or round-robin'")
     , consistent_rangemovement(this, "consistent_rangemovement", value_status::Used, true, "When set to true, range movements will be consistent. It means: 1) it will refuse to bootstrap a new node if other bootstrapping/leaving/moving nodes detected. 2) data will be streamed to a new node only from the node which is no longer responsible for the token range. Same as -Dcassandra.consistent.rangemovement in cassandra")
     , join_ring(this, "join_ring", value_status::Used, true, "When set to true, a node will join the token ring. When set to false, a node will not join the token ring. User can use nodetool join to initiate ring joinging later. Same as -Dcassandra.join_ring in cassandra.")
     , load_ring_state(this, "load_ring_state", value_status::Used, true, "When set to true, load tokens and host_ids previously saved. Same as -Dcassandra.load_ring_state in cassandra.")
@@ -672,7 +684,8 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , enable_dangerous_direct_import_of_cassandra_counters(this, "enable_dangerous_direct_import_of_cassandra_counters", value_status::Used, false, "Only turn this option on if you want to import tables from Cassandra containing counters, and you are SURE that no counters in that table were created in a version earlier than Cassandra 2.1."
         " It is not enough to have ever since upgraded to newer versions of Cassandra. If you EVER used a version earlier than 2.1 in the cluster where these SSTables come from, DO NOT TURN ON THIS OPTION! You will corrupt your data. You have been warned.")
     , enable_shard_aware_drivers(this, "enable_shard_aware_drivers", value_status::Used, true, "Enable native transport drivers to use connection-per-shard for better performance")
-
+    , enable_ipv6_dns_lookup(this, "enable_ipv6_dns_lookup", value_status::Used, false, "Use IPv6 address resolution")
+    , abort_on_internal_error(this, "abort_on_internal_error", liveness::LiveUpdate, value_status::Used, false, "Abort the server instead of throwing exception when internal invariants are violated")
     , default_log_level(this, "default_log_level", value_status::Used)
     , logger_log_level(this, "logger_log_level", value_status::Used)
     , log_to_stdout(this, "log_to_stdout", value_status::Used)
@@ -696,12 +709,20 @@ void config_file::named_value<db::config::seed_provider_type>::add_command_line_
                 boost::program_options::options_description_easy_init& init,
                 const std::string_view& name, const std::string_view& desc) {
     init((hyphenate(name) + "-class-name").data(),
-                    value_ex(&_value.class_name)->notifier(
-                                    [this](auto&&) {_source = config_source::CommandLine;}),
+                    value_ex<sstring>()->notifier(
+                                    [this](sstring new_class_name) {
+                                        auto old_seed_provider = operator()();
+                                        old_seed_provider.class_name = new_class_name;
+                                        set(std::move(old_seed_provider), config_source::CommandLine);
+                                    }),
                     desc.data());
     init((hyphenate(name) + "-parameters").data(),
-                    value_ex(&_value.parameters)->notifier(
-                                    [this](auto&&) {_source = config_source::CommandLine;}),
+                    value_ex<std::unordered_map<sstring, sstring>>()->notifier(
+                                    [this](std::unordered_map<sstring, sstring> new_parameters) {
+                                        auto old_seed_provider = operator()();
+                                        old_seed_provider.parameters = new_parameters;
+                                        set(std::move(old_seed_provider), config_source::CommandLine);
+                                    }),
                     desc.data());
 }
 
@@ -761,7 +782,7 @@ logging::settings db::config::logging_settings(const bpo::variables_map& map) co
         }
     };
 
-    auto value = [&map](auto v, auto dummy) {
+    auto value = [&map](auto& v, auto dummy) {
         auto name = utils::hyphenate(v.name());
         const bpo::variable_value& opt = map[name];
 

@@ -510,8 +510,8 @@ table::make_streaming_reader(schema_ptr s,
     return make_flat_multi_range_reader(s, std::move(source), ranges, slice, pc, nullptr, mutation_reader::forwarding::no);
 }
 
-flat_mutation_reader table::make_streaming_reader(schema_ptr schema, const dht::partition_range& range, mutation_reader::forwarding fwd_mr) const {
-    const auto& slice = schema->full_slice();
+flat_mutation_reader table::make_streaming_reader(schema_ptr schema, const dht::partition_range& range,
+        const query::partition_slice& slice, mutation_reader::forwarding fwd_mr) const {
     const auto& pc = service::get_local_streaming_read_priority();
     auto trace_state = tracing::trace_state_ptr();
     const auto fwd = streamed_mutation::forwarding::no;
@@ -979,6 +979,7 @@ table::try_flush_memtable_to_sstable(lw_shared_ptr<memtable> old, sstable_write_
             }).handle_exception([this, old, newtab, &monitor] (auto e) {
                 monitor.write_failed();
                 newtab->mark_for_deletion();
+                _config.cf_stats->failed_memtables_flushes_count++;
                 tlogger.error("failed to write sstable {}: {}", newtab->get_filename(), e);
                 // If we failed this write we will try the write again and that will create a new flush reader
                 // that will decrease dirty memory again. So we need to reset the accounting.
@@ -1029,6 +1030,7 @@ table::reshuffle_sstables(std::set<int64_t> all_generations, int64_t start) {
     };
 
     return do_with(work(start, std::move(all_generations)), [this] (work& work) {
+        tlogger.info("Reshuffling SSTables in {}...", _config.datadir);
         return lister::scan_dir(_config.datadir, { directory_entry_type::regular }, [this, &work] (fs::path parent_dir, directory_entry de) {
             auto comps = sstables::entry_descriptor::make_descriptor(parent_dir.native(), de.name);
             if (comps.component != component_type::TOC) {
@@ -1345,7 +1347,10 @@ future<> table::cleanup_sstables(sstables::compaction_descriptor descriptor, boo
             return with_semaphore(sem, 1, [this, &sst, &release_fn, is_actual_cleanup] {
                 // release reference to sstables cleaned up, otherwise space usage from their data and index
                 // components cannot be reclaimed until all of them are cleaned.
-                auto descriptor = sstables::compaction_descriptor({ std::move(sst) }, sst->get_sstable_level());
+                auto sstable_level = sst->get_sstable_level();
+                auto run_identifier = sst->run_identifier();
+                auto descriptor = sstables::compaction_descriptor({ std::move(sst) }, sstable_level,
+                    sstables::compaction_descriptor::default_max_sstable_bytes, run_identifier);
                 descriptor.release_exhausted = release_fn;
                 return this->compact_sstables(std::move(descriptor), is_actual_cleanup);
             });
@@ -1956,6 +1961,8 @@ future<int64_t>
 table::disable_sstable_write() {
     _sstable_writes_disabled_at = std::chrono::steady_clock::now();
     return _sstables_lock.write_lock().then([this] {
+      // _sstable_deletion_sem must be acquired after _sstables_lock.write_lock
+      return _sstable_deletion_sem.wait().then([this] {
         if (_sstables->all()->empty()) {
             return make_ready_future<int64_t>(0);
         }
@@ -1964,9 +1971,18 @@ table::disable_sstable_write() {
             max = std::max(max, s->generation());
         }
         return make_ready_future<int64_t>(max);
+      });
     });
 }
 
+std::chrono::steady_clock::duration table::enable_sstable_write(int64_t new_generation) {
+    if (new_generation != -1) {
+        update_sstables_known_generation(new_generation);
+    }
+    _sstable_deletion_sem.signal();
+    _sstables_lock.write_unlock();
+    return std::chrono::steady_clock::now() - _sstable_writes_disabled_at;
+}
 
 void table::set_schema(schema_ptr s) {
     assert(s->is_counter() == _schema->is_counter());

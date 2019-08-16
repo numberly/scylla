@@ -27,6 +27,7 @@ import subprocess
 import concurrent.futures
 import io
 import multiprocessing
+import xml.etree.ElementTree as ET
 
 boost_tests = [
     'bytes_ostream_test',
@@ -116,7 +117,7 @@ boost_tests = [
     'sstable_3_x_test',
     'meta_test',
     'reusable_buffer_test',
-    'multishard_writer_test',
+    'mutation_writer_test',
     'observable_test',
     'transport_test',
     'fragmented_temporary_buffer_test',
@@ -127,6 +128,7 @@ boost_tests = [
     'small_vector_test',
     'data_listeners_test',
     'truncation_migration_test',
+    'like_matcher_test',
 ]
 
 other_tests = [
@@ -184,7 +186,7 @@ def alarm_handler(signum, frame):
 
 
 if __name__ == "__main__":
-    all_modes = ['debug', 'release', 'dev']
+    all_modes = ['debug', 'release', 'dev', 'sanitize']
 
     sysmem = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
     testmem = 2e9
@@ -200,6 +202,8 @@ if __name__ == "__main__":
                         help="Run only test whose name contains given string")
     parser.add_argument('--mode', choices=all_modes, action="append", dest="modes",
                         help="Run only tests for given build mode(s)")
+    parser.add_argument('--repeat', action="store", default="1", type=int,
+                        help="number of times to repeat test execution")
     parser.add_argument('--timeout', action="store", default="3000", type=int,
                         help="timeout value for test execution")
     parser.add_argument('--jenkins', action="store",
@@ -208,19 +212,21 @@ if __name__ == "__main__":
                         help='Verbose reporting')
     parser.add_argument('--jobs', '-j', action="store", default=default_num_jobs, type=int,
                         help="Number of jobs to use for running the tests")
+    parser.add_argument('--xunit', action="store",
+                        help="Name of a file to write results of non-boost tests to in xunit format")
     args = parser.parse_args()
 
     print_progress = print_status_verbose if args.verbose else print_progress_succint
 
     custom_seastar_args = {
-        "sstable_test": ['-c1'],
-        'sstable_datafile_test': ['-c1'],
-        "sstable_3_x_test": ['-c1'],
+        "sstable_test": ['-c1', '-m2G'],
+        'sstable_datafile_test': ['-c1', '-m2G'],
+        "sstable_3_x_test": ['-c1', '-m2G'],
         "mutation_reader_test": ['-c{}'.format(min(os.cpu_count(), 3)), '-m2G'],
     }
 
     test_to_run = []
-    modes_to_run = all_modes if not args.modes else args.modes
+    modes_to_run =  ['debug', 'release', 'dev'] if not args.modes else args.modes
     for mode in modes_to_run:
         prefix = os.path.join('build', mode, 'tests')
         standard_args = '--overprovisioned --unsafe-bypass-fsync 1 --blocked-reactor-notify-ms 2000000'.split()
@@ -296,7 +302,7 @@ if __name__ == "__main__":
             def report_subcause(e):
                 print('  with error {e}\n'.format(e=e), file=file)
             report_error(e, e, report_subcause=report_subcause)
-        return (path, boost_args + exec_args, success, file.getvalue())
+        return (path, boost_args + exec_args, type, success, file.getvalue())
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs)
     futures = []
@@ -304,11 +310,15 @@ if __name__ == "__main__":
         path = test[0]
         test_type = test[1]
         exec_args = test[2] if len(test) >= 3 else []
-        futures.append(executor.submit(run_test, path, test_type, exec_args))
+        for _ in range(args.repeat):
+            futures.append(executor.submit(run_test, path, test_type, exec_args))
 
-    cookie = n_total
+    results = []
+    cookie = len(futures)
     for future in concurrent.futures.as_completed(futures):
-        test_path, test_args, success, out = future.result()
+        result = future.result()
+        results.append(result)
+        test_path, test_args, _, success, out = result
         cookie = print_progress(test_path, test_args, success, cookie)
         if not success:
             failed_tests.append((test_path, test_args, out))
@@ -317,10 +327,27 @@ if __name__ == "__main__":
         print('\nOK.')
     else:
         print('\n\nOutput of the failed tests:')
-        for test, args, out in failed_tests:
-            print("Test {} {} failed:\n{}".format(test, ' '.join(args), out))
+        for test, test_args, out in failed_tests:
+            print("Test {} {} failed:\n{}".format(test, ' '.join(test_args), out))
         print('\n\nThe following test(s) have failed:')
-        for test, args, _ in failed_tests:
-            print('  {} {}'.format(test, ' '.join(args)))
-        print('\nSummary: {} of the total {} tests failed'.format(len(failed_tests), len(test_to_run)))
+        for test, test_args, _ in failed_tests:
+            print('  {} {}'.format(test, ' '.join(test_args)))
+        print('\nSummary: {} of the total {} tests failed'.format(len(failed_tests), len(results)))
+
+    if args.xunit:
+        other_results = [r for r in results if r[2] != 'boost']
+        num_other_failed = sum(1 for r in other_results if not r[3])
+
+        xml_results = ET.Element('testsuite', name='non-boost tests',
+                tests=str(len(other_results)), failures=str(num_other_failed), errors='0')
+
+        for test_path, test_args, _, success, out in other_results:
+            xml_res = ET.SubElement(xml_results, 'testcase', name=test_path)
+            if not success:
+                xml_fail = ET.SubElement(xml_res, 'failure')
+                xml_fail.text = "Test {} {} failed:\n{}".format(test_path, ' '.join(test_args), out)
+        with open(args.xunit, "w") as f:
+            ET.ElementTree(xml_results).write(f, encoding="unicode")
+
+    if failed_tests:
         sys.exit(1)

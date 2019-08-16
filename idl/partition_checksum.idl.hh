@@ -69,6 +69,33 @@ struct get_sync_boundary_response {
     uint64_t new_rows_nr;
 };
 
+struct get_combined_row_hash_response {
+    repair_hash working_row_buf_combined_csum;
+    uint64_t working_row_buf_nr;
+};
+
 enum class row_level_diff_detect_algorithm : uint8_t {
     send_full_set,
+    send_full_set_rpc_stream,
+};
+
+enum class repair_stream_cmd : uint8_t {
+    error,
+    hash_data,
+    row_data,
+    end_of_current_hash_set,
+    needs_all_rows,
+    end_of_current_rows,
+    get_full_row_hashes,
+    put_rows_done,
+};
+
+struct repair_hash_with_cmd {
+    repair_stream_cmd cmd;
+    repair_hash hash;
+};
+
+struct repair_row_on_wire_with_cmd {
+    repair_stream_cmd cmd;
+    partition_key_and_mutation_fragments row;
 };
