@@ -160,6 +160,10 @@ public:
         return {partition_region::clustered, bound_weight::after_all_prefixed, &ck};
     }
 
+    static position_in_partition_view before_key(const clustering_key& ck) {
+        return {partition_region::clustered, bound_weight::before_all_prefixed, &ck};
+    }
+
     partition_region region() const { return _type; }
     bound_weight get_bound_weight() const { return _bound_weight; }
     bool is_partition_start() const { return _type == partition_region::partition_start; }
@@ -246,6 +250,17 @@ public:
                 _ck = *view._ck;
             }
         }
+
+    position_in_partition& operator=(position_in_partition_view view) {
+        _type = view._type;
+        _bound_weight = view._bound_weight;
+        if (view._ck) {
+            _ck = *view._ck;
+        } else {
+            _ck.reset();
+        }
+        return *this;
+    }
 
     static position_in_partition before_all_clustered_rows() {
         return {position_in_partition::range_tag_t(), bound_view::bottom()};

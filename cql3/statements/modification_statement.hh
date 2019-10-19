@@ -84,7 +84,16 @@ public:
 
 private:
     const uint32_t _bound_terms;
-
+    // If we have operation on list entries, such as adding or
+    // removing an entry, the modification statement must prefetch
+    // the old values of the list to create an idempotent mutation.
+    // If the statement has conditions, conditional columns must
+    // also be prefetched, to evaluate conditions. If the
+    // statement has IF EXISTS/IF NOT EXISTS, we prefetch all
+    // columns, to match Cassandra behaviour.
+    // This bitset contains a mask of ordinal_id identifiers
+    // of the required columns.
+    column_mask _columns_to_read;
 public:
     const schema_ptr s;
     const std::unique_ptr<attributes> attrs;
@@ -96,6 +105,12 @@ private:
     std::vector<::shared_ptr<column_condition>> _column_conditions;
     std::vector<::shared_ptr<column_condition>> _static_conditions;
 
+    // True if has _if_exists or _if_not_exists or other conditions.
+    // Pre-computed during statement prepare.
+    bool _has_conditions = false;
+    // True if any of update operations requires a prefetch.
+    // Pre-computed during statement prepare.
+    bool _requires_read = false;
     bool _if_not_exists = false;
     bool _if_exists = false;
 
@@ -151,17 +166,6 @@ public:
 
     void add_operation(::shared_ptr<operation> op);
 
-#if 0
-    public Iterable<ColumnDefinition> getColumnsWithConditions()
-    {
-        if (ifNotExists || ifExists)
-            return null;
-
-        return Iterables.concat(columnConditions == null ? Collections.<ColumnDefinition>emptyList() : Iterables.transform(columnConditions, getColumnForCondition),
-                                staticConditions == null ? Collections.<ColumnDefinition>emptyList() : Iterables.transform(staticConditions, getColumnForCondition));
-    }
-#endif
-
     void inc_cql_stats() {
         ++(*_cql_modification_counter_ptr);
     }
@@ -186,7 +190,7 @@ public:
 
     void process_where_clause(database& db, std::vector<relation_ptr> where_clause, ::shared_ptr<variable_specifications> names);
 
-protected:
+public:
     virtual dht::partition_range_vector build_partition_keys(const query_options& options, const json_cache_opt& json_cache);
     virtual query::clustering_row_ranges create_clustering_ranges(const query_options& options, const json_cache_opt& json_cache);
 
@@ -195,24 +199,32 @@ private:
         return _sets_static_columns && !_sets_regular_columns;
     }
 public:
-    bool requires_read();
+    // True if any of update operations of this statement requires
+    // a prefetch of the old cell.
+    bool requires_read() const { return _requires_read; }
 
-protected:
-    future<update_parameters::prefetched_rows_type> read_required_rows(
-                service::storage_proxy& proxy,
-                dht::partition_range_vector keys,
-                lw_shared_ptr<query::clustering_row_ranges> ranges,
-                bool local,
-                const query_options& options,
-                db::timeout_clock::time_point now,
-                tracing::trace_state_ptr trace_state,
-                service_permit permit);
+    // Columns used in this statement conditions or operations.
+    const column_mask& columns_to_read() const { return _columns_to_read; }
+
+    // Build a read_command instance to fetch the previous mutation from storage. The mutation is
+    // fetched if we need to check LWT conditions or apply updates to non-frozen list elements.
+    lw_shared_ptr<query::read_command> read_command(query::clustering_row_ranges ranges, db::consistency_level cl) const;
+    // Create a mutation object for the update operation represented by this modification statement.
+    // A single mutation object for lightweight transactions, which can only span one partition, or a vector
+    // of mutations, one per partition key, for statements which affect multiple partition keys,
+    // e.g. DELETE FROM table WHERE pk  IN (1, 2, 3).
+    std::vector<mutation> apply_updates(
+            const std::vector<dht::partition_range>& keys,
+            const std::vector<query::clustering_range>& ranges,
+            const update_parameters& params,
+            const json_cache_opt& json_cache);
 private:
     future<::shared_ptr<cql_transport::messages::result_message>>
     do_execute(service::storage_proxy& proxy, service::query_state& qs, const query_options& options);
     friend class modification_statement_executor;
 public:
-    bool has_conditions();
+    // True if the statement has IF conditions. Pre-computed during prepare.
+    bool has_conditions() const { return _has_conditions; }
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>>
     execute(service::storage_proxy& proxy, service::query_state& qs, const query_options& options) override;
@@ -223,120 +235,6 @@ private:
 
     future<::shared_ptr<cql_transport::messages::result_message>>
     execute_with_condition(service::storage_proxy& proxy, service::query_state& qs, const query_options& options);
-
-#if 0
-    public void addConditions(Composite clusteringPrefix, CQL3CasRequest request, QueryOptions options) throws InvalidRequestException
-    {
-        if (ifNotExists)
-        {
-            // If we use ifNotExists, if the statement applies to any non static columns, then the condition is on the row of the non-static
-            // columns and the prefix should be the clusteringPrefix. But if only static columns are set, then the ifNotExists apply to the existence
-            // of any static columns and we should use the prefix for the "static part" of the partition.
-            request.addNotExist(clusteringPrefix);
-        }
-        else if (ifExists)
-        {
-            request.addExist(clusteringPrefix);
-        }
-        else
-        {
-            if (columnConditions != null)
-                request.addConditions(clusteringPrefix, columnConditions, options);
-            if (staticConditions != null)
-                request.addConditions(cfm.comparator.staticPrefix(), staticConditions, options);
-        }
-    }
-
-    private ResultSet buildCasResultSet(ByteBuffer key, ColumnFamily cf, QueryOptions options) throws InvalidRequestException
-    {
-        return buildCasResultSet(keyspace(), key, columnFamily(), cf, getColumnsWithConditions(), false, options);
-    }
-
-    public static ResultSet buildCasResultSet(String ksName, ByteBuffer key, String cfName, ColumnFamily cf, Iterable<ColumnDefinition> columnsWithConditions, boolean isBatch, QueryOptions options)
-    throws InvalidRequestException
-    {
-        boolean success = cf == null;
-
-        ColumnSpecification spec = new ColumnSpecification(ksName, cfName, CAS_RESULT_COLUMN, BooleanType.instance);
-        ResultSet.Metadata metadata = new ResultSet.Metadata(Collections.singletonList(spec));
-        List<List<ByteBuffer>> rows = Collections.singletonList(Collections.singletonList(BooleanType.instance.decompose(success)));
-
-        ResultSet rs = new ResultSet(metadata, rows);
-        return success ? rs : merge(rs, buildCasFailureResultSet(key, cf, columnsWithConditions, isBatch, options));
-    }
-
-    private static ResultSet merge(ResultSet left, ResultSet right)
-    {
-        if (left.size() == 0)
-            return right;
-        else if (right.size() == 0)
-            return left;
-
-        assert left.size() == 1;
-        int size = left.metadata.names.size() + right.metadata.names.size();
-        List<ColumnSpecification> specs = new ArrayList<ColumnSpecification>(size);
-        specs.addAll(left.metadata.names);
-        specs.addAll(right.metadata.names);
-        List<List<ByteBuffer>> rows = new ArrayList<>(right.size());
-        for (int i = 0; i < right.size(); i++)
-        {
-            List<ByteBuffer> row = new ArrayList<ByteBuffer>(size);
-            row.addAll(left.rows.get(0));
-            row.addAll(right.rows.get(i));
-            rows.add(row);
-        }
-        return new ResultSet(new ResultSet.Metadata(specs), rows);
-    }
-
-    private static ResultSet buildCasFailureResultSet(ByteBuffer key, ColumnFamily cf, Iterable<ColumnDefinition> columnsWithConditions, boolean isBatch, QueryOptions options)
-    throws InvalidRequestException
-    {
-        CFMetaData cfm = cf.metadata();
-        Selection selection;
-        if (columnsWithConditions == null)
-        {
-            selection = Selection.wildcard(cfm);
-        }
-        else
-        {
-            // We can have multiple conditions on the same columns (for collections) so use a set
-            // to avoid duplicate, but preserve the order just to it follows the order of IF in the query in general
-            Set<ColumnDefinition> defs = new LinkedHashSet<>();
-            // Adding the partition key for batches to disambiguate if the conditions span multipe rows (we don't add them outside
-            // of batches for compatibility sakes).
-            if (isBatch)
-            {
-                defs.addAll(cfm.partitionKeyColumns());
-                defs.addAll(cfm.clusteringColumns());
-            }
-            for (ColumnDefinition def : columnsWithConditions)
-                defs.add(def);
-            selection = Selection.forColumns(cfm, new ArrayList<>(defs));
-
-        }
-
-        long now = System.currentTimeMillis();
-        Selection.ResultSetBuilder builder = selection.resultSetBuilder(now);
-        SelectStatement.forSelection(cfm, selection).processColumnFamily(key, cf, options, now, builder);
-
-        return builder.build(options.getProtocolVersion());
-    }
-
-    public ResultMessage executeInternal(QueryState queryState, QueryOptions options) throws RequestValidationException, RequestExecutionException
-    {
-        if (hasConditions())
-            throw new UnsupportedOperationException();
-
-        for (IMutation mutation : getMutations(options, true, queryState.getTimestamp()))
-        {
-            // We don't use counters internally.
-            assert mutation instanceof Mutation;
-
-            ((Mutation) mutation).apply();
-        }
-        return null;
-    }
-#endif
 
 public:
     /**
@@ -349,19 +247,7 @@ public:
      * @return vector of the mutations
      * @throws invalid_request_exception on invalid requests
      */
-    future<std::vector<mutation>> get_mutations(service::storage_proxy& proxy, const query_options& options, db::timeout_clock::time_point timeout, bool local, int64_t now, tracing::trace_state_ptr trace_state, service_permit permit);
-
-public:
-    future<std::unique_ptr<update_parameters>> make_update_parameters(
-                service::storage_proxy& proxy,
-                lw_shared_ptr<dht::partition_range_vector> keys,
-                lw_shared_ptr<query::clustering_row_ranges> ranges,
-                const query_options& options,
-                db::timeout_clock::time_point timeout,
-                bool local,
-                int64_t now,
-                tracing::trace_state_ptr trace_state,
-                service_permit permit);
+    future<std::vector<mutation>> get_mutations(service::storage_proxy& proxy, const query_options& options, db::timeout_clock::time_point timeout, bool local, int64_t now, service::query_state& qs);
 
 protected:
     /**

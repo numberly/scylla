@@ -71,7 +71,6 @@ public:
 private:
     sstring _keyspace;
     tracing::trace_state_ptr _trace_state_ptr;
-    unsigned _cpu_of_origin;
 #if 0
     private static final Logger logger = LoggerFactory.getLogger(ClientState.class);
     public static final SemanticVersion DEFAULT_CQL_VERSION = org.apache.cassandra.cql3.QueryProcessor.CQL_VERSION;
@@ -96,21 +95,15 @@ private:
 #endif
     ::shared_ptr<auth::authenticated_user> _user;
 
-    // Only considered in the "request copy"
-    bool _user_is_dirty = false;
-
     auth_state _auth_state = auth_state::UNINITIALIZED;
 
     // isInternal is used to mark ClientState as used by some internal component
     // that should have an ability to modify system keyspace.
     bool _is_internal;
     bool _is_thrift;
-    bool _is_request_copy = false;
 
     // The biggest timestamp that was returned by getTimestamp/assigned to a query
-    api::timestamp_type _last_timestamp_micros = 0;
-
-    bool _dirty = false;
+    static thread_local api::timestamp_type _last_timestamp_micros;
 
     // Address of a client
     socket_address _remote_address;
@@ -118,13 +111,9 @@ private:
     // Only populated for external client state.
     auth::service* _auth_service{nullptr};
 
-    // Only set for "request copy"
-    std::optional<api::timestamp_type> _request_ts;
-
 public:
     struct internal_tag {};
     struct external_tag {};
-    struct request_copy_tag {};
 
     void create_tracing_session(tracing::trace_type type, tracing::trace_state_props_set props) {
         _trace_state_ptr = tracing::tracing::get_local_tracing_instance().create_session(type, props);
@@ -146,22 +135,8 @@ public:
         _auth_state = new_state;
     }
 
-    /// \brief A cross-shard copy-constructor.
-    /// Copies everything that may be copied on the remote shard (e.g. _user is out since it's a shared_ptr).
-    /// The created copy of the original client state that may be safely used in the specific request handling flow.
-    /// The given timestamp is going to be used in the context of the corresponding query instead of being generated.
-    /// The caller must ensure that the given timestamps are monotonic in the context of a specific client/connection.
-    ///
-    /// \note May not be called if the Tracing state has already been initialized.
-    ///
-    /// \param request_copy_tag
-    /// \param orig The client_state that should be copied.
-    /// \param ts A timestamp to use during the request handling
-    client_state(request_copy_tag, const client_state& orig, api::timestamp_type ts);
-
     client_state(external_tag, auth::service& auth_service, const socket_address& remote_address = socket_address(), bool thrift = false)
-            : _cpu_of_origin(engine().cpu_id())
-            , _is_internal(false)
+            : _is_internal(false)
             , _is_thrift(thrift)
             , _remote_address(remote_address)
             , _auth_service(&auth_service) {
@@ -176,10 +151,11 @@ public:
 
     client_state(internal_tag)
             : _keyspace("system")
-            , _cpu_of_origin(engine().cpu_id())
             , _is_internal(true)
             , _is_thrift(false)
     {}
+
+    client_state(client_state&) = delete;
 
     ///
     /// `nullptr` for internal instances.
@@ -188,14 +164,8 @@ public:
         return _auth_service;
     }
 
-    void merge(const client_state& other);
-
     bool is_thrift() const {
         return _is_thrift;
-    }
-
-    bool is_dirty() const noexcept {
-        return _dirty;
     }
 
     bool is_internal() const {
@@ -205,20 +175,9 @@ public:
     /**
      * @return a ClientState object for internal C* calls (not limited by any kind of auth).
      */
-    static client_state for_internal_calls() {
-        return client_state(internal_tag());
-    }
-
-    /**
-     * The `auth::service` should be non-`nullptr` for native protocol users.
-     *
-     * @return a ClientState object for external clients (thrift/native protocol users).
-     */
-    static client_state for_external_calls(auth::service& ser) {
-        return client_state(external_tag(), ser);
-    }
-    static client_state for_external_thrift_calls(auth::service& ser) {
-        return client_state(external_tag(), ser, socket_address(), true);
+    static client_state& for_internal_calls() {
+        static thread_local client_state s(internal_tag{});
+        return s;
     }
 
     /**
@@ -226,10 +185,6 @@ public:
      * in the sequence seen, even if multiple updates happen in the same millisecond.
      */
     api::timestamp_type get_timestamp() {
-        if (_request_ts) {
-            return *_request_ts;
-        }
-
         auto current = api::new_timestamp();
         auto last = _last_timestamp_micros;
         auto result = last >= current ? last + 1 : current;
@@ -237,23 +192,55 @@ public:
         return result;
     }
 
-#if 0
     /**
-     * Can be use when a timestamp has been assigned by a query, but that timestamp is
-     * not directly one returned by getTimestamp() (see SP.beginAndRepairPaxos()).
-     * This ensure following calls to getTimestamp() will return a timestamp strictly
-     * greated than the one provided to this method.
+     * Returns a timestamp suitable for paxos given the timestamp of the last known commit (or in progress update).
+     *
+     * Paxos ensures that the timestamp it uses for commits respects the serial order of those commits. It does so
+     * by having each replica reject any proposal whose timestamp is not strictly greater than the last proposal it
+     * accepted. So in practice, which timestamp we use for a given proposal doesn't affect correctness but it does
+     * affect the chance of making progress (if we pick a timestamp lower than what has been proposed before, our
+     * new proposal will just get rejected).
+     *
+     * As during the prepared phase replica send us the last propose they accepted, a first option would be to take
+     * the maximum of those last accepted proposal timestamp plus 1 (and use a default value, say 0, if it's the
+     * first known proposal for the partition). This would mostly work (giving commits the timestamp 0, 1, 2, ...
+     * in the order they are commited) but with 2 important caveats:
+     *   1) it would give a very poor experience when Paxos and non-Paxos updates are mixed in the same partition,
+     *      since paxos operations wouldn't be using microseconds timestamps. And while you shouldn't theoretically
+     *      mix the 2 kind of operations, this would still be pretty nonintuitive. And what if you started writing
+     *      normal updates and realize later you should switch to Paxos to enforce a property you want?
+     *   2) this wouldn't actually be safe due to the expiration set on the Paxos state table.
+     *
+     * So instead, we initially chose to use the current time in microseconds as for normal update. Which works in
+     * general but mean that clock skew creates unavailability periods for Paxos updates (either a node has his clock
+     * in the past and he may no be able to get commit accepted until its clock catch up, or a node has his clock in
+     * the future and then once one of its commit his accepted, other nodes ones won't be until they catch up). This
+     * is ok for small clock skew (few ms) but can be pretty bad for large one.
+     *
+     * Hence our current solution: we mix both approaches. That is, we compare the timestamp of the last known
+     * accepted proposal and the local time. If the local time is greater, we use it, thus keeping paxos timestamps
+     * locked to the current time in general (making mixing Paxos and non-Paxos more friendly, and behaving correctly
+     * when the paxos state expire (as long as your maximum clock skew is lower than the Paxos state expiration
+     * time)). Otherwise (the local time is lower than the last proposal, meaning that this last proposal was done
+     * with a clock in the future compared to the local one), we use the last proposal timestamp plus 1, ensuring
+     * progress.
+     *
+     * @param min_timestamp_to_use the max timestamp of the last proposal accepted by replica having responded
+     * to the prepare phase of the paxos round this is for. In practice, that's the minimum timestamp this method
+     * may return.
+     * @return a timestamp suitable for a Paxos proposal (using the reasoning described above). Note that
+     * contrary to the get_timestamp() method, the return value is not guaranteed to be unique (nor
+     * monotonic) across calls since it can return it's argument (so if the same argument is passed multiple times,
+     * it may be returned multiple times). Note that we still ensure Paxos "ballot" are unique (for different
+     * proposal) by (securely) randomizing the non-timestamp part of the UUID.
      */
-    public void updateLastTimestamp(long tstampMicros)
-    {
-        while (true)
-        {
-            long last = lastTimestampMicros.get();
-            if (tstampMicros <= last || lastTimestampMicros.compareAndSet(last, tstampMicros))
-                return;
-        }
+    api::timestamp_type get_timestamp_for_paxos(api::timestamp_type min_timestamp_to_use) {
+        api::timestamp_type current = std::max(api::new_timestamp(), min_timestamp_to_use);
+        _last_timestamp_micros = _last_timestamp_micros > current ? _last_timestamp_micros + 1 : current;
+        return _last_timestamp_micros;
     }
 
+#if 0
     public SocketAddress getRemoteAddress()
     {
         return remoteAddress;
@@ -269,16 +256,6 @@ public:
     }
 
 public:
-    /// \brief Get a local copy of the orig._auth_service.
-    /// \param orig The original client_state.
-    /// \return The pointer to the local auth_service instance or nullptr if orig._auth_serice == nullptr.
-    auth::service* local_auth_service_copy(const service::client_state& orig) const;
-
-    /// \brief Get a local copy of the orig._user.
-    /// \param orig The original client_state.
-    /// \return The shared_ptr created on a local shard pointing to the auth::authenticated_user object equal to the *orig._user.
-    ::shared_ptr<auth::authenticated_user> local_user_copy(const service::client_state& orig) const;
-
     void set_keyspace(database& db, sstring keyspace);
 
     void set_raw_keyspace(sstring new_keyspace) noexcept {
@@ -336,10 +313,6 @@ public:
 
     ::shared_ptr<auth::authenticated_user> user() const {
         return _user;
-    }
-
-    bool user_is_dirty() const noexcept {
-        return _user_is_dirty;
     }
 
 #if 0

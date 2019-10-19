@@ -84,6 +84,20 @@ namespace sstables {
 
 logging::logger sstlog("sstable");
 
+namespace bi = boost::intrusive;
+
+class sstable_tracker {
+    bi::list<sstable,
+        bi::member_hook<sstable, sstable::tracker_link_type, &sstable::_tracker_link>,
+        bi::constant_time_size<false>> _sstables;
+public:
+    void add(sstable& sst) {
+        _sstables.push_back(sst);
+    }
+};
+
+static thread_local sstable_tracker tracker;
+
 // Because this is a noop and won't hold any state, it is better to use a global than a
 // thread_local. It will be faster, specially on non-x86.
 static noop_write_monitor default_noop_write_monitor;
@@ -973,6 +987,9 @@ future<> sstable::seal_sstable() {
             }).then([this, dir_f] () mutable {
                 return sstable_write_io_check([&] { return dir_f.close(); });
             }).then([this, dir_f] {
+                if (_marked_for_deletion == mark_for_deletion::implicit) {
+                    _marked_for_deletion = mark_for_deletion::none;
+                }
                 // If this point was reached, sstable should be safe in disk.
                 sstlog.debug("SSTable with generation {} of {}.{} was sealed successfully.", _generation, _schema->ks_name(), _schema->cf_name());
             });
@@ -1053,9 +1070,26 @@ void sstable::write_simple(const T& component, const io_priority_class& pc) {
     options.buffer_size = sstable_buffer_size;
     options.io_priority_class = pc;
     auto w = file_writer(std::move(f), std::move(options));
-    write(_version, w, component);
-    w.flush();
-    w.close();
+    std::exception_ptr eptr;
+    try {
+        write(_version, w, component);
+        w.flush();
+    } catch (...) {
+        eptr = std::current_exception();
+    }
+    try {
+        w.close();
+    } catch (...) {
+        std::exception_ptr close_eptr = std::current_exception();
+        sstlog.warn("failed to close file_writer: {}", close_eptr);
+        // If write succeeded but close failed, we rethrow close's exception.
+        if (!eptr) {
+            eptr = close_eptr;
+        }
+    }
+    if (eptr) {
+        std::rethrow_exception(eptr);
+    }
 }
 
 template future<> sstable::read_simple<component_type::Filter>(sstables::filter& f, const io_priority_class& pc);
@@ -1255,6 +1289,21 @@ future<> sstable::open_data() {
         if (_shards.empty()) {
             _shards = compute_shards_for_this_sstable();
         }
+        auto* sm = _components->scylla_metadata->data.get<scylla_metadata_type::Sharding, sharding_metadata>();
+        if (!sm) {
+            _open = true;
+            return make_ready_future<>();
+        }
+        auto c = &sm->token_ranges.elements;
+        // Sharding information uses a lot of memory and once we're doing with this computation we will no longer use it.
+        return do_until([c] { return c->empty(); }, [c] {
+            c->pop_back();
+            return make_ready_future<>();
+        }).then([this, c] () mutable {
+            c = {};
+            _open = true;
+            return make_ready_future<>();
+        });
     });
 }
 
@@ -2377,6 +2426,8 @@ future<> sstable::seal_sstable(bool backup)
 sstable_writer sstable::get_writer(const schema& s, uint64_t estimated_partitions,
         const sstable_writer_config& cfg, encoding_stats enc_stats, const io_priority_class& pc, shard_id shard)
 {
+    // Mark sstable for implicit deletion if destructed before it is sealed.
+    _marked_for_deletion = mark_for_deletion::implicit;
     return sstable_writer(*this, s, estimated_partitions, cfg, enc_stats, pc, shard);
 }
 
@@ -2407,7 +2458,8 @@ future<> sstable::write_components(
     }
     return seastar::async([this, mr = std::move(mr), estimated_partitions, schema = std::move(schema), cfg, stats, &pc] () mutable {
         auto wr = get_writer(*schema, estimated_partitions, cfg, stats, pc);
-        mr.consume_in_thread(std::move(wr), db::no_timeout);
+        auto validator = mutation_fragment_stream_validator(*schema, get_config().enable_sstable_key_validation());
+        mr.consume_in_thread(std::move(wr), std::move(validator), db::no_timeout);
     });
 }
 
@@ -2847,30 +2899,33 @@ int sstable::compare_by_max_timestamp(const sstable& other) const {
 
 sstable::~sstable() {
     if (_index_file) {
-        _index_file.close().handle_exception([save = _index_file, op = background_jobs().start()] (auto ep) {
+        // Registered as background job.
+        (void)_index_file.close().handle_exception([save = _index_file, op = background_jobs().start()] (auto ep) {
             sstlog.warn("sstable close index_file failed: {}", ep);
             general_disk_error();
         });
     }
     if (_data_file) {
-        _data_file.close().handle_exception([save = _data_file, op = background_jobs().start()] (auto ep) {
+        // Registered as background job.
+        (void)_data_file.close().handle_exception([save = _data_file, op = background_jobs().start()] (auto ep) {
             sstlog.warn("sstable close data_file failed: {}", ep);
             general_disk_error();
         });
     }
 
-    if (_marked_for_deletion) {
+    if (_marked_for_deletion != mark_for_deletion::none) {
         // We need to delete the on-disk files for this table. Since this is a
         // destructor, we can't wait for this to finish, or return any errors,
         // but just need to do our best. If a deletion fails for some reason we
         // log and ignore this failure, because on startup we'll again try to
         // clean up unused sstables, and because we'll never reuse the same
         // generation number anyway.
+        sstlog.debug("Deleting sstable that is {}marked for deletion", _marked_for_deletion == mark_for_deletion::implicit ? "implicitly " : "");
         try {
             // FIXME:
             // - Longer term fix is to hand off deletion of sstables to a manager that can
             //   deal with sstable marked to be deleted after the corresponding object is destructed.
-            unlink().handle_exception(
+            (void)unlink().handle_exception(
                         [op = background_jobs().start()] (std::exception_ptr eptr) {
                             try {
                                 std::rethrow_exception(eptr);
@@ -3036,6 +3091,56 @@ std::optional<std::pair<uint64_t, uint64_t>> sstable::get_sample_indexes_for_ran
     return std::nullopt;
 }
 
+/**
+ * Returns a pair of positions [p1, p2) in the summary file corresponding to
+ * pages which may include keys covered by the specified range, or a disengaged
+ * optional if the sstable does not include any keys from the range.
+ */
+std::optional<std::pair<uint64_t, uint64_t>> sstable::get_index_pages_for_range(const dht::token_range& range) {
+    const auto& entries = _components->summary.entries;
+    auto entries_size = entries.size();
+    index_comparator cmp(*_schema);
+    dht::ring_position_comparator rp_cmp(*_schema);
+    uint64_t left = 0;
+    if (range.start()) {
+        dht::ring_position_view pos = range.start()->is_inclusive()
+            ? dht::ring_position_view::starting_at(range.start()->value())
+            : dht::ring_position_view::ending_at(range.start()->value());
+
+        // There is no summary entry for the last key, so in order to determine
+        // if pos overlaps with the sstable or not we have to compare with the
+        // last key.
+        if (rp_cmp(pos, get_last_decorated_key()) > 0) {
+            // left is past the end of the sampling.
+            return std::nullopt;
+        }
+
+        left = std::distance(std::begin(entries),
+            std::lower_bound(entries.begin(), entries.end(), pos, cmp));
+
+        if (left) {
+            --left;
+        }
+    }
+    uint64_t right = entries_size;
+    if (range.end()) {
+        dht::ring_position_view pos = range.end()->is_inclusive()
+                                      ? dht::ring_position_view::ending_at(range.end()->value())
+                                      : dht::ring_position_view::starting_at(range.end()->value());
+
+        right = std::distance(std::begin(entries),
+            std::lower_bound(entries.begin(), entries.end(), pos, cmp));
+        if (right == 0) {
+            // The first key is strictly greater than right.
+            return std::nullopt;
+        }
+    }
+    if (left < right) {
+        return std::optional<std::pair<uint64_t, uint64_t>>(std::in_place_t(), left, right);
+    }
+    return std::nullopt;
+}
+
 std::vector<dht::decorated_key> sstable::get_key_samples(const schema& s, const dht::token_range& range) {
     auto index_range = get_sample_indexes_for_range(range);
     std::vector<dht::decorated_key> res;
@@ -3049,10 +3154,15 @@ std::vector<dht::decorated_key> sstable::get_key_samples(const schema& s, const 
 }
 
 uint64_t sstable::estimated_keys_for_range(const dht::token_range& range) {
-    auto sample_index_range = get_sample_indexes_for_range(range);
-    uint64_t sample_key_count = sample_index_range ? sample_index_range->second - sample_index_range->first : 0;
-    // adjust for the current sampling level
-    uint64_t estimated_keys = sample_key_count * ((downsampling::BASE_SAMPLING_LEVEL * _components->summary.header.min_index_interval) / _components->summary.header.sampling_level);
+    auto page_range = get_index_pages_for_range(range);
+    if (!page_range) {
+        return 0;
+    }
+    using uint128_t = unsigned __int128;
+    uint64_t range_pages = page_range->second - page_range->first;
+    auto total_keys = get_estimated_key_count();
+    auto total_pages = _components->summary.entries.size();
+    uint64_t estimated_keys = (uint128_t)range_pages * total_keys / total_pages;
     return std::max(uint64_t(1), estimated_keys);
 }
 
@@ -3192,7 +3302,7 @@ delete_atomically(std::vector<shared_sstable> ssts) {
             dir_f.close().get();
             sstlog.debug("{} written successfully.", pending_delete_log);
         } catch (...) {
-            sstlog.warn("Error while writing {}: {}. Ignoring.", pending_delete_log), std::current_exception();
+            sstlog.warn("Error while writing {}: {}. Ignoring.", pending_delete_log, std::current_exception());
         }
 
         parallel_for_each(ssts, [] (shared_sstable sst) {
@@ -3308,6 +3418,29 @@ mutation_source sstable::as_mutation_source() {
             return sst->read_range_rows_flat(s, range, slice, pc, no_resource_tracking(), fwd, fwd_mr);
         }
     });
+}
+
+sstable::sstable(schema_ptr schema,
+        sstring dir,
+        int64_t generation,
+        version_types v,
+        format_types f,
+        db::large_data_handler& large_data_handler,
+        gc_clock::time_point now,
+        io_error_handler_gen error_handler_gen,
+        size_t buffer_size)
+    : sstable_buffer_size(buffer_size)
+    , _schema(std::move(schema))
+    , _dir(std::move(dir))
+    , _generation(generation)
+    , _version(v)
+    , _format(f)
+    , _now(now)
+    , _read_error_handler(error_handler_gen(sstable_read_error))
+    , _write_error_handler(error_handler_gen(sstable_write_error))
+    , _large_data_handler(large_data_handler)
+{
+    tracker.add(*this);
 }
 
 bool supports_correct_non_compound_range_tombstones() {

@@ -99,8 +99,14 @@ void trim_clustering_row_ranges_to(const schema& s, clustering_row_ranges& range
 }
 
 void trim_clustering_row_ranges_to(const schema& s, clustering_row_ranges& ranges, const clustering_key& key, bool reversed) {
+    if (key.is_full(s)) {
+        return trim_clustering_row_ranges_to(s, ranges,
+                reversed ? position_in_partition_view::before_key(key) : position_in_partition_view::after_key(key), reversed);
+    }
+    auto full_key = key;
+    clustering_key::make_full(s, full_key);
     return trim_clustering_row_ranges_to(s, ranges,
-            position_in_partition_view(key, reversed ? bound_weight::before_all_prefixed : bound_weight::after_all_prefixed), reversed);
+            reversed ? position_in_partition_view::after_key(full_key) : position_in_partition_view::before_key(full_key), reversed);
 }
 
 partition_slice::partition_slice(clustering_row_ranges row_ranges,
@@ -118,6 +124,20 @@ partition_slice::partition_slice(clustering_row_ranges row_ranges,
     , _cql_format(std::move(cql_format))
     , _partition_row_limit(partition_row_limit)
 {}
+
+partition_slice::partition_slice(clustering_row_ranges ranges, const schema& s, const column_mask& mask, option_set options)
+    : partition_slice(ranges, query::column_id_vector{}, query::column_id_vector{}, options)
+{
+    regular_columns.reserve(mask.count());
+    for (ordinal_column_id id = mask.find_first(); id != column_mask::npos; id = mask.find_next(id)) {
+        const column_definition& def = s.column_at(id);
+        if (def.is_static()) {
+            static_columns.push_back(def.id);
+        } else if (def.is_regular()) {
+            regular_columns.push_back(def.id);
+        } // else clustering or partition key column - skip, these are controlled by options
+    }
+}
 
 partition_slice::partition_slice(partition_slice&&) = default;
 

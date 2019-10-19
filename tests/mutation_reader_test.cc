@@ -1457,18 +1457,24 @@ SEASTAR_THREAD_TEST_CASE(test_foreign_reader_as_mutation_source) {
 }
 
 SEASTAR_TEST_CASE(test_trim_clustering_row_ranges_to) {
+    struct null { };
+    struct missing { };
     struct key {
         int c0;
-        std::optional<int> c1;
+        std::variant<int, null, missing> c1;
 
-        key(int c0, std::optional<int> c1 = {}) : c0(c0), c1(c1) { }
+        key(int c0, int c1) : c0(c0), c1(c1) { }
+        key(int c0, null) : c0(c0), c1(null{}) { }
+        key(int c0) : c0(c0), c1(missing{}) { }
 
         clustering_key to_clustering_key(const schema& s) const {
             std::vector<bytes> v;
             v.push_back(int32_type->decompose(data_value(c0)));
-            if (c1) {
-                v.push_back(int32_type->decompose(data_value(*c1)));
-            }
+            std::visit(make_visitor(
+                    [&v] (int c1) { v.push_back(int32_type->decompose(data_value(c1))); },
+                    [&v] (null c1) { v.push_back(bytes{}); },
+                    [] (missing) { }),
+                    c1);
             return clustering_key::from_exploded(s, std::move(v));
         }
     };
@@ -1476,12 +1482,14 @@ SEASTAR_TEST_CASE(test_trim_clustering_row_ranges_to) {
         key value;
 
         incl(int c0, int c1) : value(c0, c1) { }
+        incl(int c0, null) : value(c0, null{}) { }
         incl(int c0) : value(c0) { }
     };
     struct excl {
         key value;
 
         excl(int c0, int c1) : value(c0, c1) { }
+        excl(int c0, null) : value(c0, null{}) { }
         excl(int c0) : value(c0) { }
     };
     struct bound {
@@ -1555,6 +1563,10 @@ SEASTAR_TEST_CASE(test_trim_clustering_row_ranges_to) {
     //  8) Equal to end(range with excl end)
     //  9) After range
     // 10) Full range
+    // 11) Prefix key is before range
+    // 12) Prefix key is equal to prefix start of range
+    // 13) Prefix key intersects with range
+    // 14) Prefix key is after range
 
     // (1)
     check(
@@ -1639,6 +1651,30 @@ SEASTAR_TEST_CASE(test_trim_clustering_row_ranges_to) {
             { {inf{}, inf{}} },
             {7, 9},
             { {excl{7, 9}, inf{}} });
+
+    // (11)
+    check(
+            { {incl{10, 10}, excl{10, 30}} },
+            {10},
+            { {incl{10, 10}, excl{10, 30}} });
+
+    // (12)
+    check(
+            { {incl{10}, excl{10, 30}} },
+            {10},
+            { {incl{10, null{}}, excl{10, 30}} });
+
+    // (13)
+    check(
+            { {incl{9, 10}, excl{10, 30}} },
+            {10},
+            { {incl{10, null{}}, excl{10, 30}} });
+
+    // (14)
+    check(
+            { {incl{9, 10}, excl{10, 30}} },
+            {11},
+            { });
 
     // In reversed now
 
@@ -1725,6 +1761,30 @@ SEASTAR_TEST_CASE(test_trim_clustering_row_ranges_to) {
             { {inf{}, inf{}} },
             {7, 9},
             { {inf{}, excl{7, 9}} });
+
+    // (11)
+    check_reversed(
+            { {incl{10, 10}, excl{10, 30}} },
+            {11},
+            { {incl{10, 10}, excl{10, 30}} });
+
+    // (12)
+    check_reversed(
+            { {excl{9, 39}, incl{10}} },
+            {10},
+            { {excl{9, 39}, incl{10, null{}}} });
+
+    // (13)
+    check_reversed(
+            { {incl{9, 10}, incl{10, 30}} },
+            {10},
+            { {incl{9, 10}, incl{10, null{}}} });
+
+    // (14)
+    check_reversed(
+            { {incl{9, 10}, excl{10, 30}} },
+            {9},
+            { });
 
     return make_ready_future<>();
 }
@@ -1835,7 +1895,8 @@ public:
                 std::move(trace_state), fwd_mr);
     }
     virtual void destroy_reader(shard_id shard, future<stopped_reader> reader) noexcept override {
-        reader.then([shard, this] (stopped_reader&& reader) {
+        // Move to the background.
+        (void)reader.then([shard, this] (stopped_reader&& reader) {
             return smp::submit_to(shard, [handle = std::move(reader.handle), ctx = std::move(_contexts[shard])] () mutable {
                 ctx.semaphore->unregister_inactive_read(std::move(*handle));
             });
@@ -1848,7 +1909,8 @@ public:
                 _contexts[shard].semaphore = make_foreign(std::make_unique<reader_concurrency_semaphore>(0, std::numeric_limits<ssize_t>::max()));
                  // Add a waiter, so that all registered inactive reads are
                  // immediately evicted.
-                _contexts[shard].semaphore->wait_admission(1);
+                 // We don't care about the returned future.
+                (void)_contexts[shard].semaphore->wait_admission(1);
             } else {
                 _contexts[shard].semaphore = make_foreign(std::make_unique<reader_concurrency_semaphore>(reader_concurrency_semaphore::no_limits{}));
             }
@@ -2554,7 +2616,7 @@ SEASTAR_THREAD_TEST_CASE(test_queue_reader) {
 
         auto expected_reader = flat_mutation_reader_from_mutations(expected_muts);
 
-        handle.push(std::move(*expected_reader(db::no_timeout).get0()));
+        handle.push(std::move(*expected_reader(db::no_timeout).get0())).get();
 
         BOOST_REQUIRE(!fill_buffer_fut.available());
 
@@ -2584,7 +2646,7 @@ SEASTAR_THREAD_TEST_CASE(test_queue_reader) {
 
         auto expected_reader = flat_mutation_reader_from_mutations(expected_muts);
 
-        handle.push(std::move(*expected_reader(db::no_timeout).get0()));
+        handle.push(std::move(*expected_reader(db::no_timeout).get0())).get();
 
         BOOST_REQUIRE(!fill_buffer_fut.available());
 
@@ -2605,7 +2667,7 @@ SEASTAR_THREAD_TEST_CASE(test_queue_reader) {
 
         auto expected_reader = flat_mutation_reader_from_mutations(expected_muts);
 
-        handle.push(std::move(*expected_reader(db::no_timeout).get0()));
+        handle.push(std::move(*expected_reader(db::no_timeout).get0())).get();
 
         BOOST_REQUIRE(!fill_buffer_fut.available());
 

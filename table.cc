@@ -136,9 +136,12 @@ contains_rows(const sstables::sstable& sst, const schema_ptr& schema, const ck_f
 // of a range for each clustering component.
 static std::vector<sstables::shared_sstable>
 filter_sstable_for_reader(std::vector<sstables::shared_sstable>&& sstables, column_family& cf, const schema_ptr& schema,
-        const sstables::key& key, const query::partition_slice& slice) {
-    auto sstable_has_not_key = [&] (const sstables::shared_sstable& sst) {
-        return !sst->filter_has_key(key);
+        const dht::partition_range& pr, const sstables::key& key, const query::partition_slice& slice) {
+    const dht::ring_position& pr_key = pr.start()->value();
+    auto sstable_has_not_key = [&, cmp = dht::ring_position_comparator(*schema)] (const sstables::shared_sstable& sst) {
+        return cmp(pr_key, sst->get_first_decorated_key()) < 0 ||
+               cmp(pr_key, sst->get_last_decorated_key()) > 0 ||
+               !sst->filter_has_key(key);
     };
     sstables.erase(boost::remove_if(sstables, sstable_has_not_key), sstables.end());
 
@@ -286,7 +289,7 @@ create_single_key_sstable_reader(column_family* cf,
 {
     auto key = sstables::key::from_partition_key(*schema, *pr.start()->value().key());
     auto readers = boost::copy_range<std::vector<flat_mutation_reader>>(
-        filter_sstable_for_reader(sstables->select(pr), *cf, schema, key, slice)
+        filter_sstable_for_reader(sstables->select(pr), *cf, schema, pr, key, slice)
         | boost::adaptors::transformed([&] (const sstables::shared_sstable& sstable) {
             tracing::trace(trace_state, "Reading key {} from sstable {}", pr, seastar::value_of([&sstable] { return sstable->get_filename(); }));
             return sstable->read_row_flat(schema, pr.start()->value(), slice, pc, resource_tracker, fwd);
@@ -674,6 +677,14 @@ void table::update_stats_for_new_sstable(uint64_t disk_space_used_by_sstable, co
     }
 }
 
+inline void table::add_sstable_to_backlog_tracker(compaction_backlog_tracker& tracker, sstables::shared_sstable sstable) {
+    // Don't add sstables that belong to more than one shard to the table's backlog tracker
+    // given that such sstables are supposed to be tracked only by resharding's own tracker.
+    if (!sstable->is_shared()) {
+        tracker.add_sstable(sstable);
+    }
+}
+
 void table::add_sstable(sstables::shared_sstable sstable, const std::vector<unsigned>& shards_for_the_sstable) {
     // allow in-progress reads to continue using old list
     auto new_sstables = make_lw_shared(*_sstables);
@@ -683,7 +694,7 @@ void table::add_sstable(sstables::shared_sstable sstable, const std::vector<unsi
     if (sstable->requires_view_building()) {
         _sstables_staging.emplace(sstable->generation(), sstable);
     } else {
-        _compaction_strategy.get_backlog_tracker().add_sstable(sstable);
+        add_sstable_to_backlog_tracker(_compaction_strategy.get_backlog_tracker(), sstable);
     }
 }
 
@@ -1196,7 +1207,7 @@ table::on_compaction_completion(const std::vector<sstables::shared_sstable>& new
     rebuild_statistics();
 
     // This is done in the background, so we can consider this compaction completed.
-    seastar::with_gate(_sstable_deletion_gate, [this, sstables_to_remove] {
+    (void)seastar::with_gate(_sstable_deletion_gate, [this, sstables_to_remove] {
        return with_semaphore(_sstable_deletion_sem, 1, [this, sstables_to_remove = std::move(sstables_to_remove)] {
         return sstables::delete_atomically(sstables_to_remove).then_wrapped([this, sstables_to_remove] (future<> f) {
             std::exception_ptr eptr;
@@ -1402,7 +1413,7 @@ void table::set_compaction_strategy(sstables::compaction_strategy_type strategy)
 
     auto new_sstables = new_cs.make_sstable_set(_schema);
     for (auto&& s : *_sstables->all()) {
-        new_cs.get_backlog_tracker().add_sstable(s);
+        add_sstable_to_backlog_tracker(new_cs.get_backlog_tracker(), s);
         new_sstables.insert(s);
     }
 
@@ -2083,7 +2094,8 @@ future<> table::generate_and_propagate_view_updates(const schema_ptr& base,
             flat_mutation_reader_from_mutations({std::move(m)}),
             std::move(existings)).then([this, base_token = std::move(base_token)] (std::vector<frozen_mutation_and_schema>&& updates) mutable {
         auto units = seastar::consume_units(*_config.view_update_concurrency_semaphore, memory_usage_of(updates));
-        db::view::mutate_MV(std::move(base_token), std::move(updates), _view_stats, *_config.cf_stats, std::move(units)).handle_exception([] (auto ignored) { });
+        //FIXME: discarded future.
+        (void)db::view::mutate_MV(std::move(base_token), std::move(updates), _view_stats, *_config.cf_stats, std::move(units)).handle_exception([] (auto ignored) { });
     });
 }
 
@@ -2475,7 +2487,7 @@ future<row_locker::lock_holder> table::push_view_replica_updates(const schema_pt
     return push_view_replica_updates(s, std::move(m), timeout);
 }
 
-future<row_locker::lock_holder> table::do_push_view_replica_updates(const schema_ptr& s, mutation&& m, db::timeout_clock::time_point timeout, mutation_source&& source) const {
+future<row_locker::lock_holder> table::do_push_view_replica_updates(const schema_ptr& s, mutation&& m, db::timeout_clock::time_point timeout, mutation_source&& source, const io_priority_class& io_priority) const {
     if (!_config.view_update_concurrency_semaphore->current()) {
         // We don't have resources to generate view updates for this write. If we reached this point, we failed to
         // throttle the client. The memory queue is already full, waiting on the semaphore would cause this node to
@@ -2515,13 +2527,13 @@ future<row_locker::lock_holder> table::do_push_view_replica_updates(const schema
     // We'll return this lock to the caller, which will release it after
     // writing the base-table update.
     future<row_locker::lock_holder> lockf = local_base_lock(base, m.decorated_key(), slice.default_row_ranges(), timeout);
-    return lockf.then([m = std::move(m), slice = std::move(slice), views = std::move(views), base, this, timeout, source = std::move(source)] (row_locker::lock_holder lock) {
+    return lockf.then([m = std::move(m), slice = std::move(slice), views = std::move(views), base, this, timeout, source = std::move(source), &io_priority] (row_locker::lock_holder lock) {
       return do_with(
         dht::partition_range::make_singular(m.decorated_key()),
         std::move(slice),
         std::move(m),
-        [base, views = std::move(views), lock = std::move(lock), this, timeout, source = std::move(source)] (auto& pk, auto& slice, auto& m) mutable {
-            auto reader = source.make_reader(base, pk, slice, service::get_local_sstable_query_read_priority());
+        [base, views = std::move(views), lock = std::move(lock), this, timeout, source = std::move(source), &io_priority] (auto& pk, auto& slice, auto& m) mutable {
+            auto reader = source.make_reader(base, pk, slice, io_priority);
             return this->generate_and_propagate_view_updates(base, std::move(views), std::move(m), std::move(reader)).then([lock = std::move(lock)] () mutable {
                 // return the local partition/row lock we have taken so it
                 // remains locked until the caller is done modifying this
@@ -2533,11 +2545,11 @@ future<row_locker::lock_holder> table::do_push_view_replica_updates(const schema
 }
 
 future<row_locker::lock_holder> table::push_view_replica_updates(const schema_ptr& s, mutation&& m, db::timeout_clock::time_point timeout) const {
-    return do_push_view_replica_updates(s, std::move(m), timeout, as_mutation_source());
+    return do_push_view_replica_updates(s, std::move(m), timeout, as_mutation_source(), service::get_local_sstable_query_read_priority());
 }
 
 future<row_locker::lock_holder> table::stream_view_replica_updates(const schema_ptr& s, mutation&& m, db::timeout_clock::time_point timeout, sstables::shared_sstable excluded_sstable) const {
-    return do_push_view_replica_updates(s, std::move(m), timeout, as_mutation_source_excluding(std::move(excluded_sstable)));
+    return do_push_view_replica_updates(s, std::move(m), timeout, as_mutation_source_excluding(std::move(excluded_sstable)), service::get_local_streaming_write_priority());
 }
 
 mutation_source

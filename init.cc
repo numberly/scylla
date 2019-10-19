@@ -37,9 +37,12 @@ logging::logger startlog("init");
 // duplicated in cql_test_env.cc
 // until proper shutdown is done.
 
-void init_storage_service(distributed<database>& db, sharded<gms::gossiper>& gossiper, sharded<auth::service>& auth_service, sharded<db::system_distributed_keyspace>& sys_dist_ks,
+void init_storage_service(sharded<abort_source>& abort_source,
+        distributed<database>& db, sharded<gms::gossiper>& gossiper, sharded<auth::service>& auth_service,
+        sharded<cql3::cql_config>& cql_config,
+        sharded<db::system_distributed_keyspace>& sys_dist_ks,
         sharded<db::view::view_update_generator>& view_update_generator, sharded<gms::feature_service>& feature_service, service::storage_service_config config) {
-    service::init_storage_service(db, gossiper, auth_service, sys_dist_ks, view_update_generator, feature_service, config).get();
+    service::init_storage_service(abort_source, db, gossiper, auth_service, cql_config, sys_dist_ks, view_update_generator, feature_service, config).get();
     // #293 - do not stop anything
     //engine().at_exit([] { return service::deinit_storage_service(); });
 }
@@ -162,8 +165,11 @@ void init_ms_fd_gossiper(sharded<gms::gossiper>& gossiper
         throw bad_configuration_error();
     }
     gossiper.local().set_seeds(seeds);
-    gossiper.invoke_on_all([cluster_name](gms::gossiper& g) {
+    // Do it in the background.
+    (void)gossiper.invoke_on_all([cluster_name](gms::gossiper& g) {
         g.set_cluster_name(cluster_name);
+    }).handle_exception([] (std::exception_ptr e) {
+        startlog.error("Unexpected exception while setting cluster name: {}", e);
     });
 }
 

@@ -60,6 +60,7 @@
 #include "idl/cache_temperature.dist.hh"
 #include "idl/view.dist.hh"
 #include "idl/mutation.dist.hh"
+#include "idl/messaging_service.dist.hh"
 #include "serializer_impl.hh"
 #include "serialization_visitors.hh"
 #include "idl/consistency_level.dist.impl.hh"
@@ -80,6 +81,7 @@
 #include "idl/query.dist.impl.hh"
 #include "idl/cache_temperature.dist.impl.hh"
 #include "idl/mutation.dist.impl.hh"
+#include "idl/messaging_service.dist.impl.hh"
 #include <seastar/rpc/lz4_compressor.hh>
 #include <seastar/rpc/lz4_fragmented_compressor.hh>
 #include <seastar/rpc/multi_algo_compressor_factory.hh>
@@ -289,7 +291,6 @@ void messaging_service::start_listen() {
     if (_compress_what != compress_what::none) {
         so.compressor_factory = &compressor_factory;
     }
-    so.streaming_domain = rpc::streaming_domain_type(0x55AA);
     so.load_balancing_algorithm = server_socket::load_balancing_algorithm::port;
 
     // FIXME: we don't set so.tcp_nodelay, because we can't tell at this point whether the connection will come from a
@@ -297,19 +298,21 @@ void messaging_service::start_listen() {
     //        the first by wrapping its server_socket, but not the second.
     auto limits = rpc_resource_limits(_mcfg.rpc_memory_limit);
     if (!_server[0]) {
-        auto listen = [&] (const gms::inet_address& a) {
+        auto listen = [&] (const gms::inet_address& a, rpc::streaming_domain_type sdomain) {
+            so.streaming_domain = sdomain;
             auto addr = socket_address{a, _port};
             return std::unique_ptr<rpc_protocol_server_wrapper>(new rpc_protocol_server_wrapper(*_rpc,
                     so, addr, limits));
         };
-        _server[0] = listen(_listen_address);
+        _server[0] = listen(_listen_address, rpc::streaming_domain_type(0x55AA));
         if (listen_to_bc) {
-            _server[1] = listen(utils::fb_utilities::get_broadcast_address());
+            _server[1] = listen(utils::fb_utilities::get_broadcast_address(), rpc::streaming_domain_type(0x66BB));
         }
     }
 
     if (!_server_tls[0]) {
-        auto listen = [&] (const gms::inet_address& a) {
+        auto listen = [&] (const gms::inet_address& a, rpc::streaming_domain_type sdomain) {
+            so.streaming_domain = sdomain;
             return std::unique_ptr<rpc_protocol_server_wrapper>(
                     [this, &so, &a, limits] () -> std::unique_ptr<rpc_protocol_server_wrapper>{
                 if (_encrypt_what == encrypt_what::none) {
@@ -323,9 +326,9 @@ void messaging_service::start_listen() {
                         so, seastar::tls::listen(_credentials, addr, lo), limits);
             }());
         };
-        _server_tls[0] = listen(_listen_address);
+        _server_tls[0] = listen(_listen_address, rpc::streaming_domain_type(0x77CC));
         if (listen_to_bc) {
-            _server_tls[1] = listen(utils::fb_utilities::get_broadcast_address());
+            _server_tls[1] = listen(utils::fb_utilities::get_broadcast_address(), rpc::streaming_domain_type(0x88DD));
         }
     }
     // Do this on just cpu 0, to avoid duplicate logs.
@@ -612,6 +615,7 @@ shared_ptr<messaging_service::rpc_protocol_client_wrapper> messaging_service::ge
         opts.compressor_factory = &compressor_factory;
     }
     opts.tcp_nodelay = must_tcp_nodelay;
+    opts.reuseaddr = true;
 
     auto client = must_encrypt ?
                     ::make_shared<rpc_protocol_client_wrapper>(*_rpc, std::move(opts),
@@ -623,7 +627,8 @@ shared_ptr<messaging_service::rpc_protocol_client_wrapper> messaging_service::ge
     assert(res.second);
     it = res.first;
     uint32_t src_cpu_id = engine().cpu_id();
-    _rpc->make_client<rpc::no_wait_type(gms::inet_address, uint32_t, uint64_t)>(messaging_verb::CLIENT_ID)(*it->second.rpc_client, utils::fb_utilities::get_broadcast_address(), src_cpu_id,
+    // No reply is received, nothing to wait for.
+    (void)_rpc->make_client<rpc::no_wait_type(gms::inet_address, uint32_t, uint64_t)>(messaging_verb::CLIENT_ID)(*it->second.rpc_client, utils::fb_utilities::get_broadcast_address(), src_cpu_id,
                                                                                                            query::result_memory_limiter::maximum_result_size).handle_exception([ms = shared_from_this(), remote_addr, verb] (std::exception_ptr ep) {
         mlogger.debug("Failed to send client id to {} for verb {}: {}", remote_addr, std::underlying_type_t<messaging_verb>(verb), ep);
     });
@@ -649,7 +654,7 @@ bool messaging_service::remove_rpc_client_one(clients_map& clients, msg_addr id,
         // This will make sure messaging_service::stop() blocks until
         // client->stop() is over.
         //
-        client->stop().finally([id, client, ms = shared_from_this()] {
+        (void)client->stop().finally([id, client, ms = shared_from_this()] {
             mlogger.debug("dropped connection to {}", id.addr);
         }).discard_result();
         found = true;
@@ -947,24 +952,28 @@ future<> messaging_service::send_gossip_digest_ack2(msg_addr id, gossip_digest_a
     return send_message_oneway(this, messaging_verb::GOSSIP_DIGEST_ACK2, std::move(id), std::move(msg));
 }
 
-void messaging_service::register_definitions_update(std::function<rpc::no_wait_type (const rpc::client_info& cinfo, std::vector<frozen_mutation> fm)>&& func) {
+void messaging_service::register_definitions_update(std::function<rpc::no_wait_type (const rpc::client_info& cinfo, std::vector<frozen_mutation> fm,
+            rpc::optional<std::vector<canonical_mutation>> cm)>&& func) {
     register_handler(this, netw::messaging_verb::DEFINITIONS_UPDATE, std::move(func));
 }
 void messaging_service::unregister_definitions_update() {
     _rpc->unregister_handler(netw::messaging_verb::DEFINITIONS_UPDATE);
 }
-future<> messaging_service::send_definitions_update(msg_addr id, std::vector<frozen_mutation> fm) {
-    return send_message_oneway(this, messaging_verb::DEFINITIONS_UPDATE, std::move(id), std::move(fm));
+future<> messaging_service::send_definitions_update(msg_addr id, std::vector<frozen_mutation> fm, std::vector<canonical_mutation> cm) {
+    return send_message_oneway(this, messaging_verb::DEFINITIONS_UPDATE, std::move(id), std::move(fm), std::move(cm));
 }
 
-void messaging_service::register_migration_request(std::function<future<std::vector<frozen_mutation>> (const rpc::client_info&)>&& func) {
+void messaging_service::register_migration_request(std::function<future<rpc::tuple<std::vector<frozen_mutation>, std::vector<canonical_mutation>>>
+        (const rpc::client_info&, rpc::optional<schema_pull_options>)>&& func) {
     register_handler(this, netw::messaging_verb::MIGRATION_REQUEST, std::move(func));
 }
 void messaging_service::unregister_migration_request() {
     _rpc->unregister_handler(netw::messaging_verb::MIGRATION_REQUEST);
 }
-future<std::vector<frozen_mutation>> messaging_service::send_migration_request(msg_addr id) {
-    return send_message<std::vector<frozen_mutation>>(this, messaging_verb::MIGRATION_REQUEST, std::move(id));
+future<rpc::tuple<std::vector<frozen_mutation>, rpc::optional<std::vector<canonical_mutation>>>> messaging_service::send_migration_request(msg_addr id,
+        schema_pull_options options) {
+    return send_message<future<rpc::tuple<std::vector<frozen_mutation>, rpc::optional<std::vector<canonical_mutation>>>>>(this, messaging_verb::MIGRATION_REQUEST,
+            std::move(id), options);
 }
 
 void messaging_service::register_mutation(std::function<future<rpc::no_wait_type> (const rpc::client_info&, rpc::opt_time_point, frozen_mutation fm, std::vector<inet_address> forward,
@@ -1010,14 +1019,14 @@ future<> messaging_service::send_mutation_failed(msg_addr id, unsigned shard, re
     return send_message_oneway(this, messaging_verb::MUTATION_FAILED, std::move(id), std::move(shard), std::move(response_id), num_failed, std::move(backlog));
 }
 
-void messaging_service::register_read_data(std::function<future<foreign_ptr<lw_shared_ptr<query::result>>, cache_temperature> (const rpc::client_info&, rpc::opt_time_point t, query::read_command cmd, ::compat::wrapping_partition_range pr, rpc::optional<query::digest_algorithm> oda)>&& func) {
+void messaging_service::register_read_data(std::function<future<rpc::tuple<foreign_ptr<lw_shared_ptr<query::result>>, cache_temperature>> (const rpc::client_info&, rpc::opt_time_point t, query::read_command cmd, ::compat::wrapping_partition_range pr, rpc::optional<query::digest_algorithm> oda)>&& func) {
     register_handler(this, netw::messaging_verb::READ_DATA, std::move(func));
 }
 void messaging_service::unregister_read_data() {
     _rpc->unregister_handler(netw::messaging_verb::READ_DATA);
 }
-future<query::result, rpc::optional<cache_temperature>> messaging_service::send_read_data(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const dht::partition_range& pr, query::digest_algorithm da) {
-    return send_message_timeout<future<query::result, rpc::optional<cache_temperature>>>(this, messaging_verb::READ_DATA, std::move(id), timeout, cmd, pr, da);
+future<rpc::tuple<query::result, rpc::optional<cache_temperature>>> messaging_service::send_read_data(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const dht::partition_range& pr, query::digest_algorithm da) {
+    return send_message_timeout<future<rpc::tuple<query::result, rpc::optional<cache_temperature>>>>(this, messaging_verb::READ_DATA, std::move(id), timeout, cmd, pr, da);
 }
 
 void messaging_service::register_get_schema_version(std::function<future<frozen_schema>(unsigned, table_schema_version)>&& func) {
@@ -1040,24 +1049,24 @@ future<utils::UUID> messaging_service::send_schema_check(msg_addr dst) {
     return send_message<utils::UUID>(this, netw::messaging_verb::SCHEMA_CHECK, dst);
 }
 
-void messaging_service::register_read_mutation_data(std::function<future<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature> (const rpc::client_info&, rpc::opt_time_point t, query::read_command cmd, ::compat::wrapping_partition_range pr)>&& func) {
+void messaging_service::register_read_mutation_data(std::function<future<rpc::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>> (const rpc::client_info&, rpc::opt_time_point t, query::read_command cmd, ::compat::wrapping_partition_range pr)>&& func) {
     register_handler(this, netw::messaging_verb::READ_MUTATION_DATA, std::move(func));
 }
 void messaging_service::unregister_read_mutation_data() {
     _rpc->unregister_handler(netw::messaging_verb::READ_MUTATION_DATA);
 }
-future<reconcilable_result, rpc::optional<cache_temperature>> messaging_service::send_read_mutation_data(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const dht::partition_range& pr) {
-    return send_message_timeout<future<reconcilable_result, rpc::optional<cache_temperature>>>(this, messaging_verb::READ_MUTATION_DATA, std::move(id), timeout, cmd, pr);
+future<rpc::tuple<reconcilable_result, rpc::optional<cache_temperature>>> messaging_service::send_read_mutation_data(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const dht::partition_range& pr) {
+    return send_message_timeout<future<rpc::tuple<reconcilable_result, rpc::optional<cache_temperature>>>>(this, messaging_verb::READ_MUTATION_DATA, std::move(id), timeout, cmd, pr);
 }
 
-void messaging_service::register_read_digest(std::function<future<query::result_digest, api::timestamp_type, cache_temperature> (const rpc::client_info&, rpc::opt_time_point timeout, query::read_command cmd, ::compat::wrapping_partition_range pr, rpc::optional<query::digest_algorithm> oda)>&& func) {
+void messaging_service::register_read_digest(std::function<future<rpc::tuple<query::result_digest, api::timestamp_type, cache_temperature>> (const rpc::client_info&, rpc::opt_time_point timeout, query::read_command cmd, ::compat::wrapping_partition_range pr, rpc::optional<query::digest_algorithm> oda)>&& func) {
     register_handler(this, netw::messaging_verb::READ_DIGEST, std::move(func));
 }
 void messaging_service::unregister_read_digest() {
     _rpc->unregister_handler(netw::messaging_verb::READ_DIGEST);
 }
-future<query::result_digest, rpc::optional<api::timestamp_type>, rpc::optional<cache_temperature>> messaging_service::send_read_digest(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const dht::partition_range& pr, query::digest_algorithm da) {
-    return send_message_timeout<future<query::result_digest, rpc::optional<api::timestamp_type>, rpc::optional<cache_temperature>>>(this, netw::messaging_verb::READ_DIGEST, std::move(id), timeout, cmd, pr, da);
+future<rpc::tuple<query::result_digest, rpc::optional<api::timestamp_type>, rpc::optional<cache_temperature>>> messaging_service::send_read_digest(msg_addr id, clock_type::time_point timeout, const query::read_command& cmd, const dht::partition_range& pr, query::digest_algorithm da) {
+    return send_message_timeout<future<rpc::tuple<query::result_digest, rpc::optional<api::timestamp_type>, rpc::optional<cache_temperature>>>>(this, netw::messaging_verb::READ_DIGEST, std::move(id), timeout, cmd, pr, da);
 }
 
 // Wrapper for TRUNCATE

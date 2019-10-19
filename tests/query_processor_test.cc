@@ -36,6 +36,7 @@
 #include "transport/messages/result_message.hh"
 #include "cql3/query_processor.hh"
 #include "cql3/untyped_result_set.hh"
+#include "cql3/cql_config.hh"
 
 SEASTAR_TEST_CASE(test_execute_internal_insert) {
     return do_with_cql_env([] (auto& e) {
@@ -264,17 +265,17 @@ SEASTAR_TEST_CASE(test_query_counters) {
         ++expected["EACH_QUORUM"];
         BOOST_CHECK_EQUAL(expected, get_query_metrics());
 
-        process_query("select * from ks.cf", clevel::SERIAL);
+        process_query("select * from ks.cf where k='x'", clevel::SERIAL);
         ++expected["SERIAL"];
         BOOST_CHECK_EQUAL(expected, get_query_metrics());
-        process_prepared("select * from ks.cf", clevel::SERIAL);
+        process_prepared("select * from ks.cf where k='x'", clevel::SERIAL);
         ++expected["SERIAL"];
         BOOST_CHECK_EQUAL(expected, get_query_metrics());
-        process_query("select * from ks.cf", clevel::SERIAL);
+        process_query("select * from ks.cf where k='x'", clevel::SERIAL);
         ++expected["SERIAL"];
         BOOST_CHECK_EQUAL(expected, get_query_metrics());
 
-        process_query("select * from ks.cf", clevel::LOCAL_SERIAL);
+        process_query("select * from ks.cf where k='x'", clevel::LOCAL_SERIAL);
         ++expected["LOCAL_SERIAL"];
         BOOST_CHECK_EQUAL(expected, get_query_metrics());
 

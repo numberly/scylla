@@ -213,7 +213,8 @@ void stream_session::init_messaging_service_handler() {
                             }
                         });
                     };
-                    mutation_writer::distribute_reader_and_consume_on_shards(s, dht::global_partitioner(),
+                    //FIXME: discarded future.
+                    (void)mutation_writer::distribute_reader_and_consume_on_shards(s, dht::global_partitioner(),
                         make_generating_reader(s, std::move(get_next_mutation_fragment)),
                         [plan_id, estimated_partitions, reason] (flat_mutation_reader reader) {
                             auto& cf = get_local_db().find_column_family(reader.schema());
@@ -248,7 +249,8 @@ void stream_session::init_messaging_service_handler() {
                         int32_t status = 0;
                         uint64_t received_partitions = 0;
                         if (f.failed()) {
-                            f.ignore_ready_future();
+                            sslog.error("[Stream #{}] Failed to handle STREAM_MUTATION_FRAGMENTS (receive and distribute phase) for ks={}, cf={}, peer={}: {}",
+                                    plan_id, s->ks_name(), s->cf_name(), from.addr, f.get_exception());
                             status = -1;
                         } else {
                             received_partitions = f.get0();
@@ -261,7 +263,8 @@ void stream_session::init_messaging_service_handler() {
                             return sink.close();
                         });
                     }).handle_exception([s, plan_id, from, sink] (std::exception_ptr ep) {
-                        sslog.error("[Stream #{}] Failed to handle STREAM_MUTATION_FRAGMENTS for ks={}, cf={}, peer={}: {}", plan_id, s->ks_name(), s->cf_name(), from.addr, ep);
+                        sslog.error("[Stream #{}] Failed to handle STREAM_MUTATION_FRAGMENTS (respond phase) for ks={}, cf={}, peer={}: {}",
+                                plan_id, s->ks_name(), s->cf_name(), from.addr, ep);
                     });
                     return make_ready_future<rpc::sink<int>>(sink);
                 });
@@ -508,7 +511,8 @@ void stream_session::send_failed_complete_message() {
     sslog.debug("[Stream #{}] SEND COMPLETE_MESSAGE to {}", plan_id, id);
     auto session = shared_from_this();
     bool failed = true;
-    this->ms().send_complete_message(id, plan_id, this->dst_cpu_id, failed).then([session, id, plan_id] {
+    //FIXME: discarded future.
+    (void)this->ms().send_complete_message(id, plan_id, this->dst_cpu_id, failed).then([session, id, plan_id] {
         sslog.debug("[Stream #{}] GOT COMPLETE_MESSAGE Reply from {}", plan_id, id.addr);
     }).handle_exception([session, id, plan_id] (auto ep) {
         sslog.debug("[Stream #{}] COMPLETE_MESSAGE for {} has failed: {}", plan_id, id.addr, ep);
@@ -536,7 +540,8 @@ void stream_session::start_streaming_files() {
     if (!_transfers.empty()) {
         set_state(stream_session_state::STREAMING);
     }
-    do_for_each(_transfers.begin(), _transfers.end(), [this] (auto& item) {
+    //FIXME: discarded future.
+    (void)do_for_each(_transfers.begin(), _transfers.end(), [this] (auto& item) {
         sslog.debug("[Stream #{}] Start to send cf_id={}", this->plan_id(), item.first);
         return item.second.execute();
     }).then([this] {
@@ -618,7 +623,8 @@ void stream_session::close_session(stream_session_state final_state) {
             for (auto& x : _receivers) {
                 stream_receive_task& task = x.second;
                 sslog.debug("[Stream #{}] close_session session={}, state={}, abort stream_receive_task cf_id={}", plan_id(), this, final_state, task.cf_id);
-                receiving_failed(x.first);
+                //FIXME: discarded future.
+                (void)receiving_failed(x.first);
                 task.abort();
             }
             send_failed_complete_message();
@@ -647,7 +653,8 @@ void stream_session::start() {
     } else {
         sslog.debug("[Stream #{}] Starting streaming to {} through {}", plan_id(), peer, connecting);
     }
-    on_initialization_complete().handle_exception([this] (auto ep) {
+    //FIXME: discarded future.
+    (void)on_initialization_complete().handle_exception([this] (auto ep) {
         this->on_error();
     });
 }

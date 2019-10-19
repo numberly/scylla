@@ -65,9 +65,10 @@ public:
 thrift_server::thrift_server(distributed<database>& db,
                              distributed<cql3::query_processor>& qp,
                              auth::service& auth_service,
+                             const cql3::cql_config& cql_config,
                              thrift_server_config config)
         : _stats(new thrift_stats(*this))
-        , _handler_factory(create_handler_factory(db, qp, auth_service, config.timeout_config).release())
+        , _handler_factory(create_handler_factory(db, qp, auth_service, cql_config, config.timeout_config).release())
         , _protocol_factory(new TBinaryProtocolFactoryT<TMemoryBuffer>())
         , _processor_factory(new CassandraAsyncProcessorFactory(_handler_factory))
         , _config(config) {
@@ -229,12 +230,14 @@ thrift_server::do_accepts(int which, bool keepalive) {
     if (_stop_gate.is_closed()) {
         return;
     }
-    with_gate(_stop_gate, [&, this] {
+    // Future is waited on indirectly in `stop()` (via `_stop_gate`).
+    (void)with_gate(_stop_gate, [&, this] {
         return _listeners[which].accept().then([this, which, keepalive] (accept_result ar) {
             auto&& [fd, addr] = ar;
             fd.set_nodelay(true);
             fd.set_keepalive(keepalive);
-            with_gate(_stop_gate, [&, this] {
+            // Future is waited on indirectly in `stop()` (via `_stop_gate`).
+            (void)with_gate(_stop_gate, [&, this] {
                 return do_with(connection(*this, std::move(fd), addr), [this] (auto& conn) {
                     return conn.process().then_wrapped([this, &conn] (future<> f) {
                         conn.shutdown();
@@ -261,7 +264,8 @@ void thrift_server::maybe_retry_accept(int which, bool keepalive, std::exception
     };
     auto retry_with_backoff = [&] {
         // FIXME: Consider using exponential backoff
-        sleep(1ms).then([retry = std::move(retry)] { retry(); });
+        // Done in the background.
+        (void)sleep(1ms).then([retry = std::move(retry)] { retry(); });
     };
     try {
         std::rethrow_exception(std::move(ex));

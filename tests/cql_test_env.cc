@@ -29,7 +29,9 @@
 #include "cql3/query_processor.hh"
 #include "cql3/query_options.hh"
 #include "cql3/statements/batch_statement.hh"
+#include "cql3/cql_config.hh"
 #include <seastar/core/distributed.hh>
+#include <seastar/core/abort_source.hh>
 #include <seastar/core/shared_ptr.hh>
 #include "utils/UUID_gen.hh"
 #include "service/migration_manager.hh"
@@ -120,7 +122,7 @@ private:
         service::client_state client_state;
 
         core_local_state(auth::service& auth_service)
-            : client_state(service::client_state::for_external_calls(auth_service))
+            : client_state(service::client_state::external_tag{}, auth_service)
         {
             client_state.set_login(::make_shared<auth::authenticated_user>(testing_superuser));
         }
@@ -153,9 +155,7 @@ public:
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>> execute_cql(const sstring& text) override {
         auto qs = make_query_state();
-        return local_qp().process(text, *qs, cql3::query_options::DEFAULT).finally([qs, this] {
-            _core_local.local().client_state.merge(qs->get_client_state());
-        });
+        return local_qp().process(text, *qs, cql3::query_options::DEFAULT).finally([qs] {});
     }
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>> execute_cql(
@@ -164,9 +164,7 @@ public:
     {
         auto qs = make_query_state();
         auto& lqo = *qo;
-        return local_qp().process(text, *qs, lqo).finally([qs, qo = std::move(qo), this] {
-            _core_local.local().client_state.merge(qs->get_client_state());
-        });
+        return local_qp().process(text, *qs, lqo).finally([qs, qo = std::move(qo)] {});
     }
 
     virtual future<cql3::prepared_cache_key_type> prepare(sstring query) override {
@@ -195,9 +193,7 @@ public:
 
         auto qs = make_query_state();
         return local_qp().process_statement_prepared(std::move(prepared), std::move(id), *qs, *options, true)
-            .finally([options, qs, this] {
-                _core_local.local().client_state.merge(qs->get_client_state());
-            });
+            .finally([options, qs] {});
     }
 
     virtual future<> create_table(std::function<schema(const sstring&)> schema_maker) override {
@@ -334,6 +330,9 @@ public:
 
             auto wait_for_background_jobs = defer([] { sstables::await_background_jobs_on_all_shards().get(); });
 
+            sharded<abort_source> abort_sources;
+            abort_sources.start().get();
+            auto stop_abort_sources = defer([&] { abort_sources.stop().get(); });
             auto db = ::make_shared<distributed<database>>();
             auto cfg = cfg_in.db_config;
             tmpdir data_dir;
@@ -381,13 +380,16 @@ public:
             distributed<service::storage_proxy>& proxy = service::get_storage_proxy();
             distributed<service::migration_manager>& mm = service::get_migration_manager();
             distributed<db::batchlog_manager>& bm = db::get_batchlog_manager();
+            sharded<cql3::cql_config> cql_config;
+            cql_config.start().get();
+            auto stop_cql_config = defer([&] { cql_config.stop().get(); });
 
             auto view_update_generator = ::make_shared<seastar::sharded<db::view::view_update_generator>>();
 
             auto& ss = service::get_storage_service();
             service::storage_service_config sscfg;
             sscfg.available_memory = memory::stats().total_memory();
-            ss.start(std::ref(*db), std::ref(gms::get_gossiper()), std::ref(*auth_service), std::ref(sys_dist_ks), std::ref(*view_update_generator), std::ref(*feature_service), sscfg, true, cfg_in.disabled_features).get();
+            ss.start(std::ref(abort_sources), std::ref(*db), std::ref(gms::get_gossiper()), std::ref(*auth_service), std::ref(cql_config), std::ref(sys_dist_ks), std::ref(*view_update_generator), std::ref(*feature_service), sscfg, true, cfg_in.disabled_features).get();
             auto stop_storage_service = defer([&ss] { ss.stop().get(); });
 
             database_config dbcfg;
@@ -429,8 +431,10 @@ public:
             bm.start(std::ref(qp), bmcfg).get();
             auto stop_bm = defer([&bm] { bm.stop().get(); });
 
-            view_update_generator->start(std::ref(*db), std::ref(proxy));
-            view_update_generator->invoke_on_all(&db::view::view_update_generator::start);
+            // FIXME: discarded future.
+            (void)view_update_generator->start(std::ref(*db), std::ref(proxy));
+            // FIXME: discarded future.
+            (void)view_update_generator->invoke_on_all(&db::view::view_update_generator::start);
             auto stop_view_update_generator = defer([view_update_generator] {
                 view_update_generator->stop().get();
             });
@@ -517,9 +521,7 @@ public:
             local_qp().get_cql_stats());
         auto qs = make_query_state();
         auto& lqo = *qo;
-        return local_qp().process_batch(batch, *qs, lqo, {}).finally([qs, batch, qo = std::move(qo), this] {
-            _core_local.local().client_state.merge(qs->get_client_state());
-        });
+        return local_qp().process_batch(batch, *qs, lqo, {}).finally([qs, batch, qo = std::move(qo)] {});
     }
 };
 

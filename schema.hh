@@ -27,6 +27,7 @@
 #include <boost/range/join.hpp>
 #include <boost/range/algorithm/transform.hpp>
 #include <boost/lexical_cast.hpp>
+#include <boost/dynamic_bitset.hpp>
 
 #include "cql3/column_specification.hh"
 #include <seastar/core/shared_ptr.hh>
@@ -45,6 +46,57 @@ using column_count_type = uint32_t;
 
 // Column ID, unique within column_kind
 using column_id = column_count_type;
+
+// Column ID unique within a schema. Enum class to avoid
+// mixing wtih column id.
+enum class ordinal_column_id: column_count_type {};
+
+std::ostream& operator<<(std::ostream& os, ordinal_column_id id);
+
+// Maintains a set of columns used in a query. The columns are
+// identified by ordinal_id.
+//
+// @sa column_definition::ordinal_id.
+class column_mask {
+public:
+    using bitset = boost::dynamic_bitset<uint64_t>;
+    using size_type = bitset::size_type;
+
+    // column_count_type is more narrow than size_type, but truncating a size_type max value does
+    // give column_count_type max value. This is used to avoid extra branching in
+    // find_first()/find_next().
+    static_assert(static_cast<column_count_type>(boost::dynamic_bitset<uint64_t>::npos) == ~static_cast<column_count_type>(0));
+    static constexpr ordinal_column_id npos = static_cast<ordinal_column_id>(bitset::npos);
+
+    // Set the appropriate bit for column id.
+    void set(ordinal_column_id id) {
+        column_count_type bit = static_cast<column_count_type>(id);
+        if (_mask.size() <= bit) {
+            _mask.resize(bit + 1);
+        }
+        _mask.set(bit);
+    }
+    // Test the mask for use of a given column id.
+    bool test(ordinal_column_id id) const {
+        column_count_type bit = static_cast<column_count_type>(id);
+        if (_mask.size() <= bit) {
+            return false;
+        }
+        return _mask.test(bit);
+    }
+    // @sa boost::dynamic_bistet docs
+    size_type count() const { return _mask.count(); }
+    ordinal_column_id find_first() const {
+        return static_cast<ordinal_column_id>(_mask.find_first());
+    }
+    ordinal_column_id find_next(ordinal_column_id pos) const {
+        return static_cast<ordinal_column_id>(_mask.find_next(static_cast<column_count_type>(pos)));
+    }
+    // Logical or
+    void union_with(const column_mask& with);
+private:
+    bitset _mask;
+};
 
 // Cluster-wide identifier of schema version of particular table.
 //
@@ -244,6 +296,9 @@ public:
     // equivalent to component index.
     column_id id;
 
+    // Unique within schema instance
+    ordinal_column_id ordinal_id;
+
     column_kind kind;
     ::shared_ptr<cql3::column_specification> column_specification;
 
@@ -261,6 +316,7 @@ public:
             , _thrift_bits(other._thrift_bits)
             , type(other.type)
             , id(other.id)
+            , ordinal_id(other.ordinal_id)
             , kind(other.kind)
             , column_specification(other.column_specification)
         {}
@@ -740,6 +796,8 @@ public:
 
     const column_definition* get_column_definition(const bytes& name) const;
     const column_definition& column_at(column_kind, column_id) const;
+    // Find a column definition given column ordinal id in the schema
+    const column_definition& column_at(ordinal_column_id ordinal_id) const;
     const_iterator regular_begin() const;
     const_iterator regular_end() const;
     const_iterator regular_lower_bound(const bytes& name) const;

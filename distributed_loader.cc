@@ -41,6 +41,7 @@
 extern logging::logger dblog;
 
 sstables::sstable::version_types get_highest_supported_format();
+static future<> execute_futures(std::vector<future<>>& futures);
 
 static const std::unordered_set<sstring> system_keyspaces = {
                 db::system_keyspace::NAME, db::schema_tables::NAME
@@ -366,12 +367,18 @@ static std::vector<sstables::shared_sstable> sstables_for_shard(const std::vecto
 }
 
 static future<> populate(distributed<database>& db, sstring datadir) {
-    return lister::scan_dir(datadir, { directory_entry_type::directory }, [&db] (fs::path datadir, directory_entry de) {
-        auto& ks_name = de.name;
-        if (is_system_keyspace(ks_name)) {
+    return do_with(std::vector<future<>>(), [&db, datadir = std::move(datadir)] (std::vector<future<>>& futures) {
+        // push futures that populate keyspaces into array of futures,
+        // so that the supplied callback will not block scan_dir() from
+        // reading the next entry in the directory.
+        return lister::scan_dir(datadir, { directory_entry_type::directory }, [&db, &futures] (fs::path datadir, directory_entry de) {
+            if (!is_system_keyspace(de.name)) {
+                futures.emplace_back(distributed_loader::populate_keyspace(db, datadir.native(), de.name));
+            }
             return make_ready_future<>();
-        }
-        return distributed_loader::populate_keyspace(db, datadir.native(), ks_name);
+        }).then([&futures] {
+            return execute_futures(futures);
+        });
     });
 }
 
@@ -384,7 +391,8 @@ void distributed_loader::reshard(distributed<database>& db, sstring ks_name, sst
     // refresh (triggers resharding) is issued by user while resharding is going on).
     static semaphore sem(1);
 
-    with_semaphore(sem, 1, [&db, ks_name = std::move(ks_name), cf_name = std::move(cf_name)] () mutable {
+    // FIXME: discarded future.
+    (void)with_semaphore(sem, 1, [&db, ks_name = std::move(ks_name), cf_name = std::move(cf_name)] () mutable {
         return seastar::async([&db, ks_name = std::move(ks_name), cf_name = std::move(cf_name)] () mutable {
             global_column_family_ptr cf(db, ks_name, cf_name);
 
@@ -459,7 +467,7 @@ void distributed_loader::reshard(distributed<database>& db, sstring ks_name, sst
                             }
                         }).then([&cf, sstables] {
                             // schedule deletion of shared sstables after we're certain that new unshared ones were successfully forwarded to respective shards.
-                            sstables::delete_atomically(std::move(sstables)).handle_exception([op = sstables::background_jobs().start()] (std::exception_ptr eptr) {
+                            (void)sstables::delete_atomically(std::move(sstables)).handle_exception([op = sstables::background_jobs().start()] (std::exception_ptr eptr) {
                                 try {
                                     std::rethrow_exception(eptr);
                                 } catch (...) {
@@ -506,7 +514,8 @@ future<> distributed_loader::load_new_sstables(distributed<database>& db, distri
                         abort();
                     }
                     if (sst->requires_view_building()) {
-                        view_update_generator.local().register_staging_sstable(sst, cf.shared_from_this());
+                        // FIXME: discarded future.
+                        (void)view_update_generator.local().register_staging_sstable(sst, cf.shared_from_this());
                     }
                 }
                 cf._sstables_opened_but_not_loaded.clear();

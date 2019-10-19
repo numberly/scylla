@@ -61,6 +61,7 @@
 #include "message/messaging_service.hh"
 #include <seastar/net/dns.hh>
 #include <seastar/core/memory.hh>
+#include <seastar/core/io_queue.hh>
 #include <seastar/util/log-cli.hh>
 
 #include "db/view/view_update_generator.hh"
@@ -69,6 +70,9 @@
 #include "sstables/sstables.hh"
 #include "gms/feature_service.hh"
 #include "distributed_loader.hh"
+#include "cql3/cql_config.hh"
+
+#include "alternator/server.hh"
 
 namespace fs = std::filesystem;
 
@@ -84,16 +88,26 @@ void register_tracing_keyspace_backend(backend_registry& br);
 
 }
 
+// Must live in a seastar::thread
 class stop_signal {
     bool _caught = false;
     condition_variable _cond;
+    sharded<abort_source> _abort_sources;
+    future<> _broadcasts_to_abort_sources_done = make_ready_future<>();
 private:
     void signaled() {
+        if (_caught) {
+            return;
+        }
         _caught = true;
         _cond.broadcast();
+        _broadcasts_to_abort_sources_done = _broadcasts_to_abort_sources_done.then([this] {
+            return _abort_sources.invoke_on_all(&abort_source::request_abort);
+        });
     }
 public:
     stop_signal() {
+        _abort_sources.start().get();
         engine().handle_signal(SIGINT, [this] { signaled(); });
         engine().handle_signal(SIGTERM, [this] { signaled(); });
     }
@@ -101,6 +115,8 @@ public:
         // There's no way to unregister a handler yet, so register a no-op handler instead.
         engine().handle_signal(SIGINT, [] {});
         engine().handle_signal(SIGTERM, [] {});
+        _broadcasts_to_abort_sources_done.get();
+        _abort_sources.stop().get();
     }
     future<> wait() {
         return _cond.wait([this] { return _caught; });
@@ -108,6 +124,8 @@ public:
     bool stopping() const {
         return _caught;
     }
+    abort_source& as_local_abort_source() { return _abort_sources.local(); }
+    sharded<abort_source>& as_sharded_abort_source() { return _abort_sources; }
 };
 
 template<typename K, typename V, typename... Args, typename K2, typename V2 = V>
@@ -284,8 +302,8 @@ verify_rlimit(bool developer_mode) {
 
 static bool cpu_sanity() {
 #if defined(__x86_64__) || defined(__i386__)
-    if (!__builtin_cpu_supports("sse4.2")) {
-        std::cerr << "Scylla requires a processor with SSE 4.2 support\n";
+    if (!__builtin_cpu_supports("sse4.2") || !__builtin_cpu_supports("pclmul")) {
+        std::cerr << "Scylla requires a processor with SSE 4.2 and PCLMUL support\n";
         return false;
     }
 #endif
@@ -412,6 +430,38 @@ void print_starting_message(int ac, char** av, const bpo::parsed_options& opts) 
     fmt::print("parsed command line options: {}\n", format_parsed_options(opts.options));
 }
 
+// Glue logic between db::config and cql3::cql_config
+class cql_config_updater {
+    cql3::cql_config& _cql_config;
+    const db::config& _cfg;
+    std::vector<std::any> _observers;
+private:
+    template <typename T>
+    void tie(T& dest, const db::config::named_value<T>& src) {
+        dest = src();
+        _observers.emplace_back(make_lw_shared<utils::observer<T>>(src.observe([&dest] (const T& value) { dest = value; })));
+    }
+public:
+    cql_config_updater(cql3::cql_config& cql_config, const db::config& cfg)
+            : _cql_config(cql_config), _cfg(cfg) {
+        tie(_cql_config.restrictions.partition_key_restrictions_max_cartesian_product_size, _cfg.max_partition_key_restrictions_per_query);
+        tie(_cql_config.restrictions.clustering_key_restrictions_max_cartesian_product_size, _cfg.max_clustering_key_restrictions_per_query);
+    }
+};
+
+template <typename Func>
+inline auto defer_with_log_on_error(Func&& func) {
+    auto func_with_log = [func = std::forward<Func>(func)] () mutable {
+        try {
+            std::forward<Func>(func)();
+        } catch (...) {
+            startlog.error("Unexpected error on shutdown from {}: {}", typeid(func).name(), std::current_exception());
+            throw;
+        }
+    };
+    return deferred_action(std::move(func_with_log));
+}
+
 int main(int ac, char** av) {
   int return_value = 0;
   try {
@@ -503,7 +553,7 @@ int main(int ac, char** av) {
             cfg->broadcast_to_all_shards().get();
 
             ::sighup_handler sigup_handler(opts, *cfg);
-            auto stop_sighup_handler = defer([&] {
+            auto stop_sighup_handler = defer_with_log_on_error([&] {
                 sigup_handler.stop().get();
             });
 
@@ -566,7 +616,8 @@ int main(int ac, char** av) {
                     startlog.info("stopping prometheus API server");
                     prometheus_server.stop().get();
                 }));
-                prometheus::start(prometheus_server, pctx);
+                //FIXME discarded future
+                (void)prometheus::start(prometheus_server, pctx);
                 with_scheduling_group(maintenance_scheduling_group, [&] {
                   return prometheus_server.listen(socket_address{prom_addr, pport}).handle_exception([pport, &cfg] (auto ep) {
                     startlog.error("Could not start Prometheus API server on {}:{}: {}", cfg->prometheus_address(), pport, ep);
@@ -662,6 +713,12 @@ int main(int ac, char** av) {
             static sharded<auth::service> auth_service;
             static sharded<db::system_distributed_keyspace> sys_dist_ks;
             static sharded<db::view::view_update_generator> view_update_generator;
+            static sharded<cql3::cql_config> cql_config;
+            static sharded<::cql_config_updater> cql_config_updater;
+            cql_config.start().get();
+            //FIXME: discarded future
+            (void)cql_config_updater.start(std::ref(cql_config), std::ref(*cfg));
+            auto stop_cql_config_updater = defer([&] { cql_config_updater.stop().get(); });
             auto& gossiper = gms::get_gossiper();
             gossiper.start(std::ref(feature_service), std::ref(*cfg)).get();
             // #293 - do not stop anything
@@ -669,7 +726,8 @@ int main(int ac, char** av) {
             supervisor::notify("initializing storage service");
             service::storage_service_config sscfg;
             sscfg.available_memory = memory::stats().total_memory();
-            init_storage_service(db, gossiper, auth_service, sys_dist_ks, view_update_generator, feature_service, sscfg);
+            //FIXME: discarded future
+            (void)init_storage_service(stop_signal.as_sharded_abort_source(), db, gossiper, auth_service, cql_config, sys_dist_ks, view_update_generator, feature_service, sscfg);
             supervisor::notify("starting per-shard database core");
 
             // Note: changed from using a move here, because we want the config object intact.
@@ -682,7 +740,7 @@ int main(int ac, char** av) {
             dbcfg.memtable_to_cache_scheduling_group = make_sched_group("memtable_to_cache", 200);
             dbcfg.available_memory = memory::stats().total_memory();
             db.start(std::ref(*cfg), dbcfg).get();
-            auto stop_database_and_sstables = defer([&db] {
+            auto stop_database_and_sstables = defer_with_log_on_error([&db] {
                 // #293 - do not stop anything - not even db (for real)
                 //return db.stop();
                 // call stop on each db instance, but leave the shareded<database> pointers alive.
@@ -849,7 +907,8 @@ int main(int ac, char** av) {
                     table& t = *(x.second);
                     for (sstables::shared_sstable sst : *t.get_sstables()) {
                         if (sst->requires_view_building()) {
-                            view_update_generator.local().register_staging_sstable(std::move(sst), t.shared_from_this());
+                            // FIXME: discarded future.
+                            (void)view_update_generator.local().register_staging_sstable(std::move(sst), t.shared_from_this());
                         }
                     }
                 }
@@ -874,7 +933,8 @@ int main(int ac, char** av) {
                         return db.flush_all_memtables();
                     }).get();
                     supervisor::notify("replaying commit log - removing old commitlog segments");
-                    cl->delete_segments(std::move(paths));
+                    //FIXME: discarded future
+                    (void)cl->delete_segments(std::move(paths));
                 }
             }
 
@@ -904,7 +964,8 @@ int main(int ac, char** av) {
             api::set_server_storage_proxy(ctx).get();
             api::set_server_load_sstable(ctx).get();
             static seastar::sharded<memory_threshold_guard> mtg;
-            mtg.start(cfg->large_memory_allocation_warning_threshold());
+            //FIXME: discarded future
+            (void)mtg.start(cfg->large_memory_allocation_warning_threshold());
             supervisor::notify("initializing migration manager RPC verbs");
             service::get_migration_manager().invoke_on_all([] (auto& mm) {
                 mm.init_messaging_service();
@@ -927,7 +988,8 @@ int main(int ac, char** av) {
             proxy.invoke_on_all([] (service::storage_proxy& local_proxy) {
                 auto& ss = service::get_local_storage_service();
                 ss.register_subscriber(&local_proxy);
-                local_proxy.start_hints_manager(gms::get_local_gossiper().shared_from_this(), ss.shared_from_this());
+                //FIXME: discarded future
+                (void)local_proxy.start_hints_manager(gms::get_local_gossiper().shared_from_this(), ss.shared_from_this());
             }).get();
 
             supervisor::notify("starting messaging service");
@@ -960,13 +1022,13 @@ int main(int ac, char** av) {
             auto lb = make_shared<service::load_broadcaster>(db, gms::get_local_gossiper());
             lb->start_broadcasting();
             service::get_local_storage_service().set_load_broadcaster(lb);
-            auto stop_load_broadcater = defer([lb = std::move(lb)] () {
+            auto stop_load_broadcater = defer_with_log_on_error([lb = std::move(lb)] () {
                 startlog.info("stopping load broadcaster");
                 lb->stop_broadcasting().get();
             });
             supervisor::notify("starting cf cache hit rate calculator");
             cf_cache_hitrate_calculator.start(std::ref(db), std::ref(cf_cache_hitrate_calculator)).get();
-            auto stop_cache_hitrate_calculator = defer([&cf_cache_hitrate_calculator] {
+            auto stop_cache_hitrate_calculator = defer_with_log_on_error([&cf_cache_hitrate_calculator] {
                 startlog.info("stopping cf cache hit rate calculator");
                 return cf_cache_hitrate_calculator.stop().get();
             });
@@ -976,12 +1038,13 @@ int main(int ac, char** av) {
             static sharded<service::view_update_backlog_broker> view_backlog_broker;
             view_backlog_broker.start(std::ref(proxy), std::ref(gms::get_gossiper())).get();
             view_backlog_broker.invoke_on_all(&service::view_update_backlog_broker::start).get();
-            auto stop_view_backlog_broker = defer([] {
+            auto stop_view_backlog_broker = defer_with_log_on_error([] {
                 startlog.info("stopping view update backlog broker");
                 view_backlog_broker.stop().get();
             });
 
-            api::set_server_cache(ctx);
+            //FIXME: discarded future
+            (void)api::set_server_cache(ctx);
             startlog.info("Waiting for gossip to settle before accepting client requests...");
             gms::get_local_gossiper().wait_for_gossip_to_settle().get();
             api::set_server_gossip_settle(ctx).get();
@@ -1012,6 +1075,44 @@ int main(int ac, char** av) {
                     return service::get_local_storage_service().start_rpc_server();
                 }).get();
             }
+
+            if (cfg->alternator_port() || cfg->alternator_https_port()) {
+                net::inet_address addr;
+                try {
+                    addr = net::dns::get_host_by_name(cfg->alternator_address(), family).get0().addr_list.front();
+                } catch (...) {
+                    std::throw_with_nested(std::runtime_error(fmt::format("Unable to resolve alternator_address {}", cfg->alternator_address())));
+                }
+                static sharded<alternator::executor> alternator_executor;
+                alternator_executor.start(std::ref(proxy), std::ref(mm)).get();
+                static alternator::server alternator_server(alternator_executor);
+                std::optional<uint16_t> alternator_port;
+                if (cfg->alternator_port()) {
+                    alternator_port = cfg->alternator_port();
+                }
+                std::optional<uint16_t> alternator_https_port;
+                std::optional<tls::credentials_builder> creds;
+                if (cfg->alternator_https_port()) {
+                    creds.emplace();
+                    alternator_https_port = cfg->alternator_https_port();
+                    creds->set_dh_level(tls::dh_params::level::MEDIUM);
+                    creds->set_x509_key_file(cert, key, tls::x509_crt_format::PEM).get();
+                    if (trust_store.empty()) {
+                        creds->set_system_trust().get();
+                    } else {
+                        creds->set_x509_trust_file(trust_store, tls::x509_crt_format::PEM).get();
+                    }
+                    creds->set_priority_string(db::config::default_tls_priority);
+                    if (!prio.empty()) {
+                        creds->set_priority_string(prio);
+                    }
+                    if (clauth) {
+                        creds->set_client_auth(seastar::tls::client_auth::REQUIRE);
+                    }
+                }
+                alternator_server.init(addr, alternator_port, alternator_https_port, creds, cfg->alternator_enforce_authorization()).get();
+            }
+
             if (cfg->defragment_memory_on_idle()) {
                 smp::invoke_on_all([] () {
                     engine().set_idle_cpu_handler([] (reactor::work_waiting_on_reactor check_for_work) {
@@ -1030,29 +1131,29 @@ int main(int ac, char** av) {
             api::set_server_done(ctx).get();
             supervisor::notify("serving");
             // Register at_exit last, so that storage_service::drain_on_shutdown will be called first
-            auto stop_repair = defer([] {
+            auto stop_repair = defer_with_log_on_error([] {
                 startlog.info("stopping repair");
                 repair_shutdown(service::get_local_storage_service().db()).get();
             });
 
-            auto stop_view_update_generator = defer([] {
+            auto stop_view_update_generator = defer_with_log_on_error([] {
                 startlog.info("stopping view update generator");
                 view_update_generator.stop().get();
             });
 
-            auto do_drain = defer([] {
+            auto do_drain = defer_with_log_on_error([] {
                 startlog.info("draining local storage");
                 service::get_local_storage_service().drain_on_shutdown().get();
             });
 
-            auto stop_view_builder = defer([cfg] {
+            auto stop_view_builder = defer_with_log_on_error([cfg] {
                 if (cfg->view_building()) {
                     startlog.info("stopping view builder");
                     view_builder.stop().get();
                 }
             });
 
-            auto stop_compaction_manager = defer([&db] {
+            auto stop_compaction_manager = defer_with_log_on_error([&db] {
                 db.invoke_on_all([](auto& db) {
                     startlog.info("stopping compaction manager");
                     return db.get_compaction_manager().stop();

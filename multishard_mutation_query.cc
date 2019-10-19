@@ -262,7 +262,7 @@ flat_mutation_reader read_context::create_reader(
         schema_ptr schema,
         const dht::partition_range& pr,
         const query::partition_slice& ps,
-        const io_priority_class&,
+        const io_priority_class& pc,
         tracing::trace_state_ptr trace_state,
         mutation_reader::forwarding) {
     const auto shard = engine().cpu_id();
@@ -290,8 +290,6 @@ flat_mutation_reader read_context::create_reader(
         rm.rparts = make_foreign(std::make_unique<reader_meta::remote_parts>(table.read_concurrency_semaphore()));
     }
 
-    //TODO need a way to transport io_priority_calls across shards
-    auto& pc = service::get_local_sstable_query_read_priority();
     rm.rparts->range = std::make_unique<const dht::partition_range>(pr);
     rm.rparts->slice = std::make_unique<const query::partition_slice>(ps);
     rm.rparts->read_operation = table.read_in_progress();
@@ -301,7 +299,8 @@ flat_mutation_reader read_context::create_reader(
 }
 
 void read_context::destroy_reader(shard_id shard, future<stopped_reader> reader_fut) noexcept {
-    with_gate(_dismantling_gate, [this, shard, reader_fut = std::move(reader_fut)] () mutable {
+    // Future is waited on indirectly in `stop()` (via `_dismantling_gate`).
+    (void)with_gate(_dismantling_gate, [this, shard, reader_fut = std::move(reader_fut)] () mutable {
         return reader_fut.then_wrapped([this, shard] (future<stopped_reader>&& reader_fut) {
             auto& rm = _readers[shard];
 
@@ -333,10 +332,12 @@ future<> read_context::stop() {
     auto pr = promise<>();
     auto fut = pr.get_future();
     auto gate_fut = _dismantling_gate.is_closed() ? make_ready_future<>() : _dismantling_gate.close();
-    gate_fut.then([this] {
+    // Forwarded to `fut`.
+    (void)gate_fut.then([this] {
         for (shard_id shard = 0; shard != smp::count; ++shard) {
             if (_readers[shard].state == reader_state::saving) {
-                _db.invoke_on(shard, [schema = global_schema_ptr(_schema), rm = std::move(_readers[shard])] (database& db) mutable {
+                // Move to the background.
+                (void)_db.invoke_on(shard, [schema = global_schema_ptr(_schema), rm = std::move(_readers[shard])] (database& db) mutable {
                     // We cannot use semaphore() here, as this can be already destroyed.
                     auto& table = db.find_column_family(schema);
                     table.read_concurrency_semaphore().unregister_inactive_read(std::move(*rm.handle));
@@ -625,7 +626,7 @@ static future<reconcilable_result> do_query_mutations(
     });
 }
 
-future<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature> query_mutations_on_all_shards(
+future<std::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>> query_mutations_on_all_shards(
         distributed<database>& db,
         schema_ptr s,
         const query::read_command& cmd,
@@ -634,9 +635,10 @@ future<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature> query
         uint64_t max_size,
         db::timeout_clock::time_point timeout) {
     if (cmd.row_limit == 0 || cmd.slice.partition_row_limit() == 0 || cmd.partition_limit == 0) {
-        return make_ready_future<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>(
+        return make_ready_future<std::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>>(
+            std::tuple(
                 make_foreign(make_lw_shared<reconcilable_result>()),
-                db.local().find_column_family(s).get_global_cache_hit_rate());
+                db.local().find_column_family(s).get_global_cache_hit_rate()));
     }
 
     return db.local().get_result_memory_limiter().new_mutation_read(max_size).then([&, s = std::move(s), trace_state = std::move(trace_state),
@@ -647,14 +649,14 @@ future<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature> query
             auto& stats = local_db.get_stats();
             if (f.failed()) {
                 ++stats.total_reads_failed;
-                return make_exception_future<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>(f.get_exception());
+                return make_exception_future<std::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>>(f.get_exception());
             } else {
                 ++stats.total_reads;
                 auto result = f.get0();
                 stats.short_mutation_queries += bool(result.is_short_read());
                 auto hit_rate = local_db.find_column_family(s).get_global_cache_hit_rate();
-                return make_ready_future<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>(
-                        make_foreign(make_lw_shared<reconcilable_result>(std::move(result))), hit_rate);
+                return make_ready_future<std::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>>(
+                        std::tuple(make_foreign(make_lw_shared<reconcilable_result>(std::move(result))), hit_rate));
             }
         });
     });

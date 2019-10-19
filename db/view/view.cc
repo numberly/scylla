@@ -455,7 +455,7 @@ void create_virtual_column(schema_builder& builder, const bytes& name, const dat
         // A map has keys and values. We don't need these values,
         // and can use empty values instead.
         auto mtype = dynamic_pointer_cast<const map_type_impl>(type);
-        builder.with_column(name, map_type_impl::get_instance(mtype->get_values_type(), empty_type, true), column_kind::regular_column, column_view_virtual::yes);
+        builder.with_column(name, map_type_impl::get_instance(mtype->get_keys_type(), empty_type, true), column_kind::regular_column, column_view_virtual::yes);
     } else if (ctype->is_set()) {
         // A set's cell has nothing beyond the keys, so the
         // virtual version of a set is, unfortunately, a complete
@@ -1150,7 +1150,8 @@ future<> view_builder::start() {
         calculate_shard_build_step(std::move(built), std::move(in_progress)).get();
         _mm.register_listener(this);
         _current_step = _base_to_build_step.begin();
-        _build_step.trigger();
+        // Waited on indirectly in stop().
+        (void)_build_step.trigger();
     });
     return make_ready_future<>();
 }
@@ -1163,6 +1164,10 @@ future<> view_builder::stop() {
         return _sem.wait().then([this] {
             _sem.broken();
             return _build_step.join();
+        }).handle_exception_type([] (const broken_semaphore&) {
+            // ignored
+        }).handle_exception_type([] (const semaphore_timed_out&) {
+            // ignored
         });
     });
 }
@@ -1339,7 +1344,8 @@ future<> view_builder::calculate_shard_build_step(
             if (built_views.find(view->id()) != built_views.end()) {
                 if (engine().cpu_id() == 0) {
                     auto f = _sys_dist_ks.finish_view_build(std::move(view_name.first), std::move(view_name.second)).then([view = std::move(view)] {
-                        system_keyspace::remove_view_build_progress_across_all_shards(view->cf_name(), view->ks_name());
+                        //FIXME: discarded future.
+                        (void)system_keyspace::remove_view_build_progress_across_all_shards(view->cf_name(), view->ks_name());
                     });
                     bookkeeping_ops->push_back(std::move(f));
                 }
@@ -1399,8 +1405,9 @@ future<> view_builder::calculate_shard_build_step(
     }
 
     auto f = seastar::when_all_succeed(bookkeeping_ops->begin(), bookkeeping_ops->end());
-    return f.handle_exception([bookkeeping_ops = std::move(bookkeeping_ops)] (std::exception_ptr ep) {
-        vlogger.error("Failed to update materialized view bookkeeping ({}), continuing anyway.", ep);
+    return f.handle_exception([this, bookkeeping_ops = std::move(bookkeeping_ops)] (std::exception_ptr ep) {
+        log_level severity = _as.abort_requested() ? log_level::warn : log_level::error;
+        vlogger.log(severity, "Failed to update materialized view bookkeeping ({}), continuing anyway.", ep);
     });
 }
 
@@ -1427,7 +1434,8 @@ static future<> flush_base(lw_shared_ptr<column_family> base, abort_source& as) 
 }
 
 void view_builder::on_create_view(const sstring& ks_name, const sstring& view_name) {
-    with_semaphore(_sem, 1, [ks_name, view_name, this] {
+    // Do it in the background, serialized.
+    (void)with_semaphore(_sem, 1, [ks_name, view_name, this] {
         auto view = view_ptr(_db.find_schema(ks_name, view_name));
         auto& step = get_or_create_build_step(view->view_info()->base_id());
         return when_all(step.base->await_pending_writes(), step.base->await_pending_streams()).discard_result().then([this, &step] {
@@ -1442,14 +1450,16 @@ void view_builder::on_create_view(const sstring& ks_name, const sstring& view_na
                 if (f.failed()) {
                     vlogger.error("Error setting up view for building {}.{}: {}", view->ks_name(), view->cf_name(), f.get_exception());
                 }
-                _build_step.trigger();
+                // Waited on indirectly in stop().
+                (void)_build_step.trigger();
             });
         });
     }).handle_exception_type([] (no_such_column_family&) { });
 }
 
 void view_builder::on_update_view(const sstring& ks_name, const sstring& view_name, bool) {
-    with_semaphore(_sem, 1, [ks_name, view_name, this] {
+    // Do it in the background, serialized.
+    (void)with_semaphore(_sem, 1, [ks_name, view_name, this] {
         auto view = view_ptr(_db.find_schema(ks_name, view_name));
         auto step_it = _base_to_build_step.find(view->view_info()->base_id());
         if (step_it == _base_to_build_step.end()) {
@@ -1466,7 +1476,8 @@ void view_builder::on_update_view(const sstring& ks_name, const sstring& view_na
 
 void view_builder::on_drop_view(const sstring& ks_name, const sstring& view_name) {
     vlogger.info0("Stopping to build view {}.{}", ks_name, view_name);
-    with_semaphore(_sem, 1, [ks_name, view_name, this] {
+    // Do it in the background, serialized.
+    (void)with_semaphore(_sem, 1, [ks_name, view_name, this] {
         // The view is absent from the database at this point, so find it by brute force.
         ([&, this] {
             for (auto& [_, step] : _base_to_build_step) {
@@ -1714,8 +1725,9 @@ void view_builder::execute(build_step& step, exponential_backoff_retry r) {
                     system_keyspace::update_view_build_progress(view->ks_name(), view->cf_name(), *next_token));
         }
     }
-    seastar::when_all_succeed(bookkeeping_ops.begin(), bookkeeping_ops.end()).handle_exception([] (std::exception_ptr ep) {
-        vlogger.error("Failed to update materialized view bookkeeping ({}), continuing anyway.", ep);
+    seastar::when_all_succeed(bookkeeping_ops.begin(), bookkeeping_ops.end()).handle_exception([this] (std::exception_ptr ep) {
+        log_level severity = _as.abort_requested() ? log_level::warn : log_level::error;
+        vlogger.log(severity, "Failed to update materialized view bookkeeping ({}), continuing anyway.", ep);
     }).get();
 }
 

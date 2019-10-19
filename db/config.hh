@@ -275,6 +275,7 @@ public:
     named_value<bool> enable_deprecated_partitioners;
     named_value<bool> enable_keyspace_column_family_metrics;
     named_value<bool> enable_sstable_data_integrity_check;
+    named_value<bool> enable_sstable_key_validation;
     named_value<bool> cpu_scheduler;
     named_value<bool> view_building;
     named_value<bool> enable_sstables_mc_format;
@@ -282,6 +283,13 @@ public:
     named_value<bool> enable_shard_aware_drivers;
     named_value<bool> enable_ipv6_dns_lookup;
     named_value<bool> abort_on_internal_error;
+    named_value<uint32_t> max_partition_key_restrictions_per_query;
+    named_value<uint32_t> max_clustering_key_restrictions_per_query;
+
+    named_value<uint16_t> alternator_port;
+    named_value<uint16_t> alternator_https_port;
+    named_value<sstring> alternator_address;
+    named_value<bool> alternator_enforce_authorization;
 
     seastar::logging_settings logging_settings(const boost::program_options::variables_map&) const;
 

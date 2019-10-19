@@ -54,6 +54,14 @@ shared_ptr<term>
 lists::literal::prepare(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver) {
     validate_assignable_to(db, keyspace, receiver);
 
+    // In Cassandra, an empty (unfrozen) map/set/list is equivalent to the column being null. In
+    // other words a non-frozen collection only exists if it has elements. Return nullptr right
+    // away to simplify predicate evaluation. See also
+    // https://issues.apache.org/jira/browse/CASSANDRA-5141
+    if (receiver->type->is_multi_cell() &&  _elements.empty()) {
+        return cql3::constants::null_literal::NULL_VALUE;
+    }
+
     auto&& value_spec = value_spec_of(receiver);
     std::vector<shared_ptr<term>> values;
     values.reserve(_elements.size());
@@ -303,7 +311,7 @@ lists::setter_by_index::execute(mutation& m, const clustering_key_prefix& prefix
     auto idx = with_linearized(*index, [] (bytes_view v) {
         return value_cast<int32_t>(data_type_for<int32_t>()->deserialize(v));
     });
-    auto&& existing_list_opt = params.get_prefetched_list(m.key().view(), prefix.view(), column);
+    auto&& existing_list_opt = params.get_prefetched_list(m.key(), prefix, column);
     if (!existing_list_opt) {
         throw exceptions::invalid_request_exception("Attempted to set an element on a list which is null");
     }
@@ -314,14 +322,15 @@ lists::setter_by_index::execute(mutation& m, const clustering_key_prefix& prefix
         throw exceptions::invalid_request_exception(format("List index {:d} out of bound, list has size {:d}",
                 idx, existing_list.size()));
     }
-
-    const bytes& eidx = existing_list[idx].key;
+    const data_value& eidx_dv = existing_list[idx].first;
+    bytes eidx = eidx_dv.type()->decompose(eidx_dv);
     list_type_impl::mutation mut;
     mut.cells.reserve(1);
     if (!value) {
-        mut.cells.emplace_back(eidx, params.make_dead_cell());
+        mut.cells.emplace_back(std::move(eidx), params.make_dead_cell());
     } else {
-        mut.cells.emplace_back(eidx, params.make_cell(*ltype->value_comparator(), *value, atomic_cell::collection_member::yes));
+        mut.cells.emplace_back(std::move(eidx),
+                params.make_cell(*ltype->value_comparator(), *value, atomic_cell::collection_member::yes));
     }
     auto smut = ltype->serialize_mutation_form(mut);
     m.set_cell(prefix, column, atomic_cell_or_collection::from_collection_mutation(std::move(smut)));
@@ -437,7 +446,7 @@ void
 lists::discarder::execute(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params) {
     assert(column.type->is_multi_cell()); // "Attempted to delete from a frozen list";
 
-    auto&& existing_list = params.get_prefetched_list(m.key().view(), prefix.view(), column);
+    auto&& existing_list = params.get_prefetched_list(m.key(), prefix, column);
     // We want to call bind before possibly returning to reject queries where the value provided is not a list.
     auto&& value = _t->bind(params._options);
 
@@ -467,13 +476,15 @@ lists::discarder::execute(mutation& m, const clustering_key_prefix& prefix, cons
     auto&& to_discard = lvalue->_elements;
     collection_type_impl::mutation mnew;
     for (auto&& cell : elist) {
-        auto have_value = [&] (bytes_view value) {
+        auto has_value = [&] (bytes_view value) {
             return std::find_if(to_discard.begin(), to_discard.end(),
                                 [ltype, value] (auto&& v) { return ltype->get_elements_type()->equal(*v, value); })
                                          != to_discard.end();
         };
-        if (have_value(cell.value)) {
-            mnew.cells.emplace_back(cell.key, params.make_dead_cell());
+        bytes eidx = cell.first.type()->decompose(cell.first);
+        bytes value = cell.second.type()->decompose(cell.second);
+        if (has_value(value)) {
+            mnew.cells.emplace_back(std::move(eidx), params.make_dead_cell());
         }
     }
     auto mnew_ser = ltype->serialize_mutation_form(mnew);
@@ -500,7 +511,7 @@ lists::discarder_by_index::execute(mutation& m, const clustering_key_prefix& pre
     auto cvalue = dynamic_pointer_cast<constants::value>(index);
     assert(cvalue);
 
-    auto&& existing_list_opt = params.get_prefetched_list(m.key().view(), prefix.view(), column);
+    auto&& existing_list_opt = params.get_prefetched_list(m.key(), prefix, column);
     int32_t idx = read_simple_exactly<int32_t>(*cvalue->_bytes);
     if (!existing_list_opt) {
         throw exceptions::invalid_request_exception("Attempted to delete an element from a list which is null");
@@ -510,7 +521,9 @@ lists::discarder_by_index::execute(mutation& m, const clustering_key_prefix& pre
         throw exceptions::invalid_request_exception(format("List index {:d} out of bound, list has size {:d}", idx, existing_list.size()));
     }
     collection_type_impl::mutation mut;
-    mut.cells.emplace_back(existing_list[idx].key, params.make_dead_cell());
+    const data_value& eidx_dv = existing_list[idx].first;
+    bytes eidx = eidx_dv.type()->decompose(eidx_dv);
+    mut.cells.emplace_back(std::move(eidx), params.make_dead_cell());
     m.set_cell(prefix, column, ltype->serialize_mutation_form(mut));
 }
 

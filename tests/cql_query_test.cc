@@ -43,8 +43,10 @@
 #include "types/list.hh"
 #include "types/set.hh"
 #include "db/config.hh"
+#include "cql3/cql_config.hh"
 #include "sstables/compaction_manager.hh"
 #include "exception_utils.hh"
+#include "json.hh"
 
 using namespace std::literals::chrono_literals;
 
@@ -362,6 +364,56 @@ SEASTAR_TEST_CASE(test_in_clause_validation) {
         test_bind(sstring(1, '\255'), true);
         test_bind("proper utf8 string", false);
     });
+}
+
+SEASTAR_THREAD_TEST_CASE(test_in_clause_cartesian_product_limits) {
+    do_with_cql_env_thread([] (cql_test_env& e) {
+        e.execute_cql("CREATE TABLE tab1 (pk1 int, pk2 int, PRIMARY KEY ((pk1, pk2)))").get();
+
+        // 100 partitions, should pass
+        e.execute_cql("SELECT * FROM tab1 WHERE pk1 IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)"
+                "                           AND pk2 IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)").get();
+        // 110 partitions, should fail
+        BOOST_REQUIRE_THROW(
+                e.execute_cql("SELECT * FROM tab1 WHERE pk1 IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)"
+                        "                          AND pk2 IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)").get(),
+                        std::runtime_error);
+
+        e.execute_cql("CREATE TABLE tab2 (pk1 int, ck1 int, ck2 int, PRIMARY KEY (pk1, ck1, ck2))").get();
+
+        // 100 clustering rows, should pass
+        e.execute_cql("SELECT * FROM tab2 WHERE pk1 = 1"
+                "                          AND ck1 IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)"
+                "                          AND ck2 IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)").get();
+        // 110 clustering rows, should fail
+        BOOST_REQUIRE_THROW(
+                e.execute_cql("SELECT * FROM tab2 WHERE pk1 = 1"
+                        "                           AND ck1 IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)"
+                        "                           AND ck2 IN (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)").get(),
+                        std::runtime_error);
+        auto make_tuple = [] (unsigned count) -> sstring {
+            std::ostringstream os;
+            os << "(0";
+            for (unsigned i = 1; i < count; ++i) {
+                os << "," << i;
+            }
+            os << ")";
+            return os.str();
+        };
+        e.execute_cql("CREATE TABLE tab3 (pk1 int, ck1 int, PRIMARY KEY (pk1, ck1))").get();
+        // tuple with 100 keys, should pass
+        e.execute_cql(fmt::format("SELECT * FROM tab3 WHERE pk1 IN {}", make_tuple(100))).get();
+        e.execute_cql(fmt::format("SELECT * FROM tab3 WHERE pk1 = 1 AND ck1 IN {}", make_tuple(100))).get();
+        // tuple with 101 keys, should fail
+        BOOST_REQUIRE_THROW(
+                e.execute_cql(fmt::format("SELECT * FROM tab3 WHERE pk1 IN {}", make_tuple(101))).get(),
+                std::runtime_error
+                );
+        BOOST_REQUIRE_THROW(
+                e.execute_cql(fmt::format("SELECT * FROM tab3 WHERE pk1 = 3 AND ck1 IN {}", make_tuple(101))).get(),
+                std::runtime_error
+                );
+    }).get();
 }
 
 SEASTAR_TEST_CASE(test_tuple_elements_validation) {
@@ -1158,10 +1210,8 @@ SEASTAR_TEST_CASE(test_map_insert_update) {
         }).then([&e] {
             // overwrite whole map, but bad syntax
             return e.execute_cql("update cf set map1 = {1003, 4003} where p1 = 'key1';");
-        }).then_wrapped([](future<shared_ptr<cql_transport::messages::result_message>> f) {
+        }).then_wrapped([&e](future<shared_ptr<cql_transport::messages::result_message>> f) {
             BOOST_REQUIRE(f.failed());
-            std::move(f).discard_result();
-        }).then([&e] {
             // overwrite whole map
             return e.execute_cql(
                 "update cf set map1 = {1001: 5001, 1002: 5002, 1003: 5003} where p1 = 'key1';").discard_result();
@@ -1263,6 +1313,12 @@ SEASTAR_TEST_CASE(test_set_insert_update) {
         }).then([&e, my_set_type] {
             return e.require_column_has_value("cf", {sstring("key1")}, {},
                     "set1", make_set_value(my_set_type, set_type_impl::native_type({})));
+        }).then([&e] {
+            return e.execute_cql("insert into cf (p1, set1) values ('key1', {});").discard_result();
+        }).then([&e, my_set_type] {
+            // Empty non-frozen set is indistinguishable from NULL
+            return e.require_column_has_value("cf", {sstring("key1")}, {},
+                    "set1", make_set_value(my_set_type, set_type_impl::native_type({})));
         });
     });
 }
@@ -1319,6 +1375,12 @@ SEASTAR_TEST_CASE(test_list_insert_update) {
         }).then([&e] {
             return e.execute_cql("insert into cf (p1, list1) values ('key1', null);").discard_result();
         }).then([&e, my_list_type] {
+            return e.require_column_has_value("cf", {sstring("key1")}, {},
+                    "list1", make_list_value(my_list_type, list_type_impl::native_type({})));
+        }).then([&e] {
+            return e.execute_cql("insert into cf (p1, list1) values ('key1', []);").discard_result();
+        }).then([&e, my_list_type] {
+            // Empty non-frozen list is indistinguishable from NULL
             return e.require_column_has_value("cf", {sstring("key1")}, {},
                     "list1", make_list_value(my_list_type, list_type_impl::native_type({})));
         });
@@ -1780,48 +1842,41 @@ SEASTAR_TEST_CASE(test_validate_table) {
 }
 
 SEASTAR_TEST_CASE(test_table_compression) {
-    return do_with_cql_env([] (cql_test_env& e) {
-        return make_ready_future<>().then([&e] {
-            return e.execute_cql("create table tb1 (foo text PRIMARY KEY, bar text) with compression = { };");
-        }).then_wrapped([&e] (future<shared_ptr<cql_transport::messages::result_message>> f) {
-            assert(!f.failed());
-            e.require_table_exists("ks", "tb1");
-            BOOST_REQUIRE(e.local_db().find_schema("ks", "tb1")->get_compressor_params().get_compressor() == nullptr);
-            return e.execute_cql("create table tb5 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : '' };");
-        }).then_wrapped([&e] (future<shared_ptr<cql_transport::messages::result_message>> f) {
-            assert(!f.failed());
-            e.require_table_exists("ks", "tb5");
-            BOOST_REQUIRE(e.local_db().find_schema("ks", "tb5")->get_compressor_params().get_compressor() == nullptr);
-            return e.execute_cql("create table tb2 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : 'LossyCompressor' };");
-        }).then_wrapped([&e] (future<shared_ptr<cql_transport::messages::result_message>> f) {
-            assert_that_failed(f);
-            return e.execute_cql("create table tb2 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : 'LZ4Compressor', 'chunk_length_kb' : -1 };");
-        }).then_wrapped([&e] (future<shared_ptr<cql_transport::messages::result_message>> f) {
-            assert_that_failed(f);
-            return e.execute_cql("create table tb2 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : 'LZ4Compressor', 'chunk_length_kb' : 3 };");
-        }).then_wrapped([&e] (future<shared_ptr<cql_transport::messages::result_message>> f) {
-            assert_that_failed(f);
-            return e.execute_cql("create table tb2 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : 'LZ4Compressor', 'chunk_length_kb' : 2 };");
-        }).then_wrapped([&e] (future<shared_ptr<cql_transport::messages::result_message>> f) {
-            assert(!f.failed());
-            e.require_table_exists("ks", "tb2");
-            BOOST_REQUIRE(e.local_db().find_schema("ks", "tb2")->get_compressor_params().get_compressor() == compressor::lz4);
-            BOOST_REQUIRE(e.local_db().find_schema("ks", "tb2")->get_compressor_params().chunk_length() == 2 * 1024);
-            return e.execute_cql("create table tb3 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : 'DeflateCompressor' };");
-        }).then_wrapped([&e] (future<shared_ptr<cql_transport::messages::result_message>> f) {
-            assert(!f.failed());
-            e.require_table_exists("ks", "tb3");
-            BOOST_REQUIRE(e.local_db().find_schema("ks", "tb3")->get_compressor_params().get_compressor() == compressor::deflate);
-            return e.execute_cql("create table tb4 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : 'org.apache.cassandra.io.compress.DeflateCompressor' };");
-        }).then_wrapped([&e] (future<shared_ptr<cql_transport::messages::result_message>> f) {
-            assert(!f.failed());
-            e.require_table_exists("ks", "tb4");
-            BOOST_REQUIRE(e.local_db().find_schema("ks", "tb4")->get_compressor_params().get_compressor() == compressor::deflate);
-            return e.execute_cql("create table tb6 (foo text PRIMARY KEY, bar text);");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
-            e.require_table_exists("ks", "tb6");
-            BOOST_REQUIRE(e.local_db().find_schema("ks", "tb6")->get_compressor_params().get_compressor() == compressor::lz4);
-        });
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        e.execute_cql("create table tb1 (foo text PRIMARY KEY, bar text) with compression = { };").get();
+        e.require_table_exists("ks", "tb1").get();
+        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb1")->get_compressor_params().get_compressor() == nullptr);
+
+        e.execute_cql("create table tb5 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : '' };").get();
+        e.require_table_exists("ks", "tb5").get();
+        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb5")->get_compressor_params().get_compressor() == nullptr);
+
+        BOOST_REQUIRE_THROW(e.execute_cql(
+                "create table tb2 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : 'LossyCompressor' };"),
+                std::exception);
+        BOOST_REQUIRE_THROW(e.execute_cql(
+                "create table tb2 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : 'LZ4Compressor', 'chunk_length_kb' : -1 };"),
+                std::exception);
+        BOOST_REQUIRE_THROW(e.execute_cql(
+                "create table tb2 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : 'LZ4Compressor', 'chunk_length_kb' : 3 };"),
+                std::exception);
+
+        e.execute_cql("create table tb2 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : 'LZ4Compressor', 'chunk_length_kb' : 2 };").get();
+        e.require_table_exists("ks", "tb2").get();
+        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb2")->get_compressor_params().get_compressor() == compressor::lz4);
+        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb2")->get_compressor_params().chunk_length() == 2 * 1024);
+
+        e.execute_cql("create table tb3 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : 'DeflateCompressor' };").get();
+        e.require_table_exists("ks", "tb3").get();
+        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb3")->get_compressor_params().get_compressor() == compressor::deflate);
+
+        e.execute_cql("create table tb4 (foo text PRIMARY KEY, bar text) with compression = { 'sstable_compression' : 'org.apache.cassandra.io.compress.DeflateCompressor' };").get();
+        e.require_table_exists("ks", "tb4").get();
+        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb4")->get_compressor_params().get_compressor() == compressor::deflate);
+
+        e.execute_cql("create table tb6 (foo text PRIMARY KEY, bar text);").get();
+        e.require_table_exists("ks", "tb6").get();
+        BOOST_REQUIRE(e.local_db().find_schema("ks", "tb6")->get_compressor_params().get_compressor() == compressor::lz4);
     });
 }
 
@@ -1940,59 +1995,58 @@ SEASTAR_TEST_CASE(test_ttl) {
 }
 
 SEASTAR_TEST_CASE(test_types) {
-    return do_with_cql_env([] (cql_test_env& e) {
-        return make_ready_future<>().then([&e] {
-            return e.execute_cql(
-                "CREATE TABLE all_types ("
-                    "    a ascii PRIMARY KEY,"
-                    "    b bigint,"
-                    "    c blob,"
-                    "    d boolean,"
-                    "    e double,"
-                    "    f float,"
-                    "    g inet,"
-                    "    h int,"
-                    "    i text,"
-                    "    j timestamp,"
-                    "    k timeuuid,"
-                    "    l uuid,"
-                    "    m varchar,"
-                    "    n varint,"
-                    "    o decimal,"
-                    "    p tinyint,"
-                    "    q smallint,"
-                    "    r date,"
-                    "    s time,"
-                    "    u duration,"
-                    ");").discard_result();
-        }).then([&e] {
-            e.require_table_exists("ks", "all_types");
-            return e.execute_cql(
-                "INSERT INTO all_types (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, u) VALUES ("
-                    "    'ascii',"
-                    "    123456789,"
-                    "    0xdeadbeef,"
-                    "    true,"
-                    "    3.14,"
-                    "    3.14,"
-                    "    '127.0.0.1',"
-                    "    3,"
-                    "    'zażółć gęślą jaźń',"
-                    "    '2001-10-18 14:15:55.134+0000',"
-                    "    d2177dd0-eaa2-11de-a572-001b779c76e3,"
-                    "    d2177dd0-eaa2-11de-a572-001b779c76e3,"
-                    "    'varchar',"
-                    "    123,"
-                    "    1.23,"
-                    "    3,"
-                    "    3,"
-                    "    '1970-01-02',"
-                    "    '00:00:00.000000001',"
-                    "    1y2mo3w4d5h6m7s8ms9us10ns"
-                    ");").discard_result();
-        }).then([&e] {
-            return e.execute_cql("SELECT * FROM all_types WHERE a = 'ascii'");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        e.execute_cql(
+            "CREATE TABLE all_types ("
+                "    a ascii PRIMARY KEY,"
+                "    b bigint,"
+                "    c blob,"
+                "    d boolean,"
+                "    e double,"
+                "    f float,"
+                "    g inet,"
+                "    h int,"
+                "    i text,"
+                "    j timestamp,"
+                "    k timeuuid,"
+                "    l uuid,"
+                "    m varchar,"
+                "    n varint,"
+                "    o decimal,"
+                "    p tinyint,"
+                "    q smallint,"
+                "    r date,"
+                "    s time,"
+                "    u duration,"
+                ");").get();
+        e.require_table_exists("ks", "all_types").get();
+
+        e.execute_cql(
+            "INSERT INTO all_types (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, u) VALUES ("
+                "    'ascii',"
+                "    123456789,"
+                "    0xdeadbeef,"
+                "    true,"
+                "    3.14,"
+                "    3.14,"
+                "    '127.0.0.1',"
+                "    3,"
+                "    'zażółć gęślą jaźń',"
+                "    '2001-10-18 14:15:55.134+0000',"
+                "    d2177dd0-eaa2-11de-a572-001b779c76e3,"
+                "    d2177dd0-eaa2-11de-a572-001b779c76e3,"
+                "    'varchar',"
+                "    123,"
+                "    1.23,"
+                "    3,"
+                "    3,"
+                "    '1970-01-02',"
+                "    '00:00:00.000000001',"
+                "    1y2mo3w4d5h6m7s8ms9us10ns"
+                ");").get();
+
+        {
+            auto msg = e.execute_cql("SELECT * FROM all_types WHERE a = 'ascii'").get0();
             struct tm t = { 0 };
             t.tm_year = 2001 - 1900;
             t.tm_mon = 10 - 1;
@@ -2020,31 +2074,33 @@ SEASTAR_TEST_CASE(test_types) {
                     duration_type->decompose(cql_duration("1y2mo3w4d5h6m7s8ms9us10ns"))
                 }
             });
-            return e.execute_cql(
-                "INSERT INTO all_types (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, u) VALUES ("
-                    "    blobAsAscii(asciiAsBlob('ascii2')),"
-                    "    blobAsBigint(bigintAsBlob(123456789)),"
-                    "    bigintAsBlob(12),"
-                    "    blobAsBoolean(booleanAsBlob(true)),"
-                    "    blobAsDouble(doubleAsBlob(3.14)),"
-                    "    blobAsFloat(floatAsBlob(3.14)),"
-                    "    blobAsInet(inetAsBlob('127.0.0.1')),"
-                    "    blobAsInt(intAsBlob(3)),"
-                    "    blobAsText(textAsBlob('zażółć gęślą jaźń')),"
-                    "    blobAsTimestamp(timestampAsBlob('2001-10-18 14:15:55.134+0000')),"
-                    "    blobAsTimeuuid(timeuuidAsBlob(d2177dd0-eaa2-11de-a572-001b779c76e3)),"
-                    "    blobAsUuid(uuidAsBlob(d2177dd0-eaa2-11de-a572-001b779c76e3)),"
-                    "    blobAsVarchar(varcharAsBlob('varchar')), blobAsVarint(varintAsBlob(123)),"
-                    "    blobAsDecimal(decimalAsBlob(1.23)),"
-                    "    blobAsTinyint(tinyintAsBlob(3)),"
-                    "    blobAsSmallint(smallintAsBlob(3)),"
-                    "    blobAsDate(dateAsBlob('1970-01-02')),"
-                    "    blobAsTime(timeAsBlob('00:00:00.000000001')),"
-                    "    blobAsDuration(durationAsBlob(10y9mo8w7d6h5m4s3ms2us1ns))"
-                    ");").discard_result();
-        }).then([&e] {
-             return e.execute_cql("SELECT * FROM all_types WHERE a = 'ascii2'");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+
+        e.execute_cql(
+            "INSERT INTO all_types (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, u) VALUES ("
+                "    blobAsAscii(asciiAsBlob('ascii2')),"
+                "    blobAsBigint(bigintAsBlob(123456789)),"
+                "    bigintAsBlob(12),"
+                "    blobAsBoolean(booleanAsBlob(true)),"
+                "    blobAsDouble(doubleAsBlob(3.14)),"
+                "    blobAsFloat(floatAsBlob(3.14)),"
+                "    blobAsInet(inetAsBlob('127.0.0.1')),"
+                "    blobAsInt(intAsBlob(3)),"
+                "    blobAsText(textAsBlob('zażółć gęślą jaźń')),"
+                "    blobAsTimestamp(timestampAsBlob('2001-10-18 14:15:55.134+0000')),"
+                "    blobAsTimeuuid(timeuuidAsBlob(d2177dd0-eaa2-11de-a572-001b779c76e3)),"
+                "    blobAsUuid(uuidAsBlob(d2177dd0-eaa2-11de-a572-001b779c76e3)),"
+                "    blobAsVarchar(varcharAsBlob('varchar')), blobAsVarint(varintAsBlob(123)),"
+                "    blobAsDecimal(decimalAsBlob(1.23)),"
+                "    blobAsTinyint(tinyintAsBlob(3)),"
+                "    blobAsSmallint(smallintAsBlob(3)),"
+                "    blobAsDate(dateAsBlob('1970-01-02')),"
+                "    blobAsTime(timeAsBlob('00:00:00.000000001')),"
+                "    blobAsDuration(durationAsBlob(10y9mo8w7d6h5m4s3ms2us1ns))"
+                ");").get();
+
+        {
+            auto msg = e.execute_cql("SELECT * FROM all_types WHERE a = 'ascii2'").get0();
             struct tm t = {0};
             t.tm_year = 2001 - 1900;
             t.tm_mon = 10 - 1;
@@ -2072,48 +2128,50 @@ SEASTAR_TEST_CASE(test_types) {
                     duration_type->decompose(cql_duration("10y9mo8w7d6h5m4s3ms2us1ns"))
                 }
             });
-        });
+        }
     });
 }
 
 SEASTAR_TEST_CASE(test_order_by) {
-    return do_with_cql_env([] (cql_test_env& e) {
-        return e.execute_cql("create table torder (p1 int, c1 int, c2 int, r1 int, r2 int, PRIMARY KEY(p1, c1, c2));").discard_result().then([&e] {
-            e.require_table_exists("ks", "torder");
-            return e.execute_cql("insert into torder (p1, c1, c2, r1) values (0, 1, 2, 3);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into torder (p1, c1, c2, r1) values (0, 2, 1, 0);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("select  c1, c2, r1 from torder where p1 = 0 order by c1 asc;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        e.execute_cql("create table torder (p1 int, c1 int, c2 int, r1 int, r2 int, PRIMARY KEY(p1, c1, c2));").discard_result().get();
+        e.require_table_exists("ks", "torder").get();
+
+        e.execute_cql("insert into torder (p1, c1, c2, r1) values (0, 1, 2, 3);").get();
+        e.execute_cql("insert into torder (p1, c1, c2, r1) values (0, 2, 1, 0);").get();
+
+        {
+            auto msg = e.execute_cql("select  c1, c2, r1 from torder where p1 = 0 order by c1 asc;").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(1), int32_type->decompose(2), int32_type->decompose(3)},
                 {int32_type->decompose(2), int32_type->decompose(1), int32_type->decompose(0)},
             });
-            return e.execute_cql("select c1, c2, r1 from torder where p1 = 0 order by c1 desc;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+        {
+            auto msg = e.execute_cql("select c1, c2, r1 from torder where p1 = 0 order by c1 desc;").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(2), int32_type->decompose(1), int32_type->decompose(0)},
                 {int32_type->decompose(1), int32_type->decompose(2), int32_type->decompose(3)},
             });
-            return e.execute_cql("insert into torder (p1, c1, c2, r1) values (0, 1, 1, 4);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into torder (p1, c1, c2, r1) values (0, 2, 2, 5);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("select c1, c2, r1 from torder where p1 = 0 order by c1 desc, c2 desc;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+
+        e.execute_cql("insert into torder (p1, c1, c2, r1) values (0, 1, 1, 4);").get();
+        e.execute_cql("insert into torder (p1, c1, c2, r1) values (0, 2, 2, 5);").get();
+        {
+            auto msg = e.execute_cql("select c1, c2, r1 from torder where p1 = 0 order by c1 desc, c2 desc;").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(2), int32_type->decompose(2), int32_type->decompose(5)},
                 {int32_type->decompose(2), int32_type->decompose(1), int32_type->decompose(0)},
                 {int32_type->decompose(1), int32_type->decompose(2), int32_type->decompose(3)},
                 {int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(4)},
             });
-            return e.execute_cql("insert into torder (p1, c1, c2, r1) values (1, 1, 0, 6);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into torder (p1, c1, c2, r1) values (1, 2, 3, 7);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("select c1, c2, r1 from torder where p1 in (0, 1) order by c1 desc, c2 desc;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+
+        e.execute_cql("insert into torder (p1, c1, c2, r1) values (1, 1, 0, 6);").get();
+        e.execute_cql("insert into torder (p1, c1, c2, r1) values (1, 2, 3, 7);").get();
+
+        {
+            auto msg = e.execute_cql("select c1, c2, r1 from torder where p1 in (0, 1) order by c1 desc, c2 desc;").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(2), int32_type->decompose(3), int32_type->decompose(7)},
                 {int32_type->decompose(2), int32_type->decompose(2), int32_type->decompose(5)},
@@ -2122,9 +2180,10 @@ SEASTAR_TEST_CASE(test_order_by) {
                 {int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(4)},
                 {int32_type->decompose(1), int32_type->decompose(0), int32_type->decompose(6)},
             });
-        }).then([&e] {
-            return e.execute_cql("select c1, c2, r1 from torder where p1 in (0, 1) order by c1 asc, c2 asc;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+
+        {
+            auto msg = e.execute_cql("select c1, c2, r1 from torder where p1 in (0, 1) order by c1 asc, c2 asc;").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(1), int32_type->decompose(0), int32_type->decompose(6)},
                 {int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(4)},
@@ -2133,71 +2192,96 @@ SEASTAR_TEST_CASE(test_order_by) {
                 {int32_type->decompose(2), int32_type->decompose(2), int32_type->decompose(5)},
                 {int32_type->decompose(2), int32_type->decompose(3), int32_type->decompose(7)},
             });
-            return e.execute_cql("select c1, c2, r1 from torder where p1 in (0, 1) and c1 < 2 order by c1 desc, c2 desc limit 1;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+
+        {
+            auto msg = e.execute_cql("select c1, c2, r1 from torder where p1 in (0, 1) and c1 < 2 order by c1 desc, c2 desc limit 1;").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(1), int32_type->decompose(2), int32_type->decompose(3)},
             });
-            return e.execute_cql("select c1, c2, r1 from torder where p1 in (0, 1) and c1 >= 2 order by c1 asc, c2 asc limit 1;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+
+        {
+            auto msg = e.execute_cql("select c1, c2, r1 from torder where p1 in (0, 1) and c1 >= 2 order by c1 asc, c2 asc limit 1;").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(2), int32_type->decompose(1), int32_type->decompose(0)},
             });
-            return e.execute_cql("select c1, c2, r1 from torder where p1 in (0, 1) order by c1 desc, c2 desc limit 1;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+
+        {
+            auto msg = e.execute_cql("select c1, c2, r1 from torder where p1 in (0, 1) order by c1 desc, c2 desc limit 1;").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(2), int32_type->decompose(3), int32_type->decompose(7)},
             });
-            return e.execute_cql("select c1, c2, r1 from torder where p1 in (0, 1) order by c1 asc, c2 asc limit 1;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+
+        {
+            auto msg = e.execute_cql("select c1, c2, r1 from torder where p1 in (0, 1) order by c1 asc, c2 asc limit 1;").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(1), int32_type->decompose(0), int32_type->decompose(6)},
             });
-            return e.execute_cql("select c1, c2, r1 from torder where p1 = 0 and c1 > 1 order by c1 desc, c2 desc;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+
+        {
+            auto msg = e.execute_cql("select c1, c2, r1 from torder where p1 = 0 and c1 > 1 order by c1 desc, c2 desc;").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(2), int32_type->decompose(2), int32_type->decompose(5)},
                 {int32_type->decompose(2), int32_type->decompose(1), int32_type->decompose(0)},
             });
-            return e.execute_cql("select c1, c2, r1 from torder where p1 = 0 and c1 >= 2 order by c1 desc, c2 desc;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+
+        {
+            auto msg = e.execute_cql("select c1, c2, r1 from torder where p1 = 0 and c1 >= 2 order by c1 desc, c2 desc;").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(2), int32_type->decompose(2), int32_type->decompose(5)},
                 {int32_type->decompose(2), int32_type->decompose(1), int32_type->decompose(0)},
             });
-            return e.execute_cql("select c1, c2, r1 from torder where p1 = 0 and c1 >= 2 order by c1 desc, c2 desc limit 1;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+
+        {
+            auto msg = e.execute_cql("select c1, c2, r1 from torder where p1 = 0 and c1 >= 2 order by c1 desc, c2 desc limit 1;").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(2), int32_type->decompose(2), int32_type->decompose(5)},
             });
-            return e.execute_cql("select c1, c2, r1 from torder where p1 = 0 order by c1 desc, c2 desc limit 1;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+
+        {
+            auto msg = e.execute_cql("select c1, c2, r1 from torder where p1 = 0 order by c1 desc, c2 desc limit 1;").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(2), int32_type->decompose(2), int32_type->decompose(5)},
             });
-            return e.execute_cql("select c1, c2, r1 from torder where p1 = 0 and c1 > 1 order by c1 asc, c2 asc;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+
+        }
+
+        {
+            auto msg = e.execute_cql("select c1, c2, r1 from torder where p1 = 0 and c1 > 1 order by c1 asc, c2 asc;").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(2), int32_type->decompose(1), int32_type->decompose(0)},
                 {int32_type->decompose(2), int32_type->decompose(2), int32_type->decompose(5)},
             });
-            return e.execute_cql("select c1, c2, r1 from torder where p1 = 0 and c1 >= 2 order by c1 asc, c2 asc;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+
+        {
+            auto msg = e.execute_cql("select c1, c2, r1 from torder where p1 = 0 and c1 >= 2 order by c1 asc, c2 asc;").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(2), int32_type->decompose(1), int32_type->decompose(0)},
                 {int32_type->decompose(2), int32_type->decompose(2), int32_type->decompose(5)},
             });
-            return e.execute_cql("select c1, c2, r1 from torder where p1 = 0 and c1 >= 2 order by c1 asc, c2 asc limit 1;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+
+        {
+            auto msg = e.execute_cql("select c1, c2, r1 from torder where p1 = 0 and c1 >= 2 order by c1 asc, c2 asc limit 1;").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(2), int32_type->decompose(1), int32_type->decompose(0)},
             });
-            return e.execute_cql("select c1, c2, r1 from torder where p1 = 0 order by c1 asc, c2 asc limit 1;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+
+        {
+            auto msg = e.execute_cql("select c1, c2, r1 from torder where p1 = 0 order by c1 asc, c2 asc limit 1;").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(1), int32_type->decompose(1), int32_type->decompose(4)},
             });
-        });
+        }
     });
 }
 
@@ -2221,166 +2305,151 @@ SEASTAR_TEST_CASE(test_order_by_validate) {
 }
 
 SEASTAR_TEST_CASE(test_multi_column_restrictions) {
-    return do_with_cql_env([] (cql_test_env& e) {
-        return e.execute_cql("create table tmcr (p1 int, c1 int, c2 int, c3 int, r1 int, PRIMARY KEY (p1, c1, c2, c3));").discard_result().then([&e] {
-            e.require_table_exists("ks", "tmcr");
-            return e.execute_cql("insert into tmcr (p1, c1, c2, c3, r1) values (0, 0, 0, 0, 0);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tmcr (p1, c1, c2, c3, r1) values (0, 0, 0, 1, 1);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tmcr (p1, c1, c2, c3, r1) values (0, 0, 1, 0, 2);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tmcr (p1, c1, c2, c3, r1) values (0, 0, 1, 1, 3);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tmcr (p1, c1, c2, c3, r1) values (0, 1, 0, 0, 4);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tmcr (p1, c1, c2, c3, r1) values (0, 1, 0, 1, 5);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tmcr (p1, c1, c2, c3, r1) values (0, 1, 1, 0, 6);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tmcr (p1, c1, c2, c3, r1) values (0, 1, 1, 1, 7);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("select r1 from tmcr where p1 = 0 and (c1, c2, c3) = (0, 1, 1);");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        e.execute_cql("create table tmcr (p1 int, c1 int, c2 int, c3 int, r1 int, PRIMARY KEY (p1, c1, c2, c3));").get();
+        e.require_table_exists("ks", "tmcr").get();
+        e.execute_cql("insert into tmcr (p1, c1, c2, c3, r1) values (0, 0, 0, 0, 0);").get();
+        e.execute_cql("insert into tmcr (p1, c1, c2, c3, r1) values (0, 0, 0, 1, 1);").get();
+        e.execute_cql("insert into tmcr (p1, c1, c2, c3, r1) values (0, 0, 1, 0, 2);").get();
+        e.execute_cql("insert into tmcr (p1, c1, c2, c3, r1) values (0, 0, 1, 1, 3);").get();
+        e.execute_cql("insert into tmcr (p1, c1, c2, c3, r1) values (0, 1, 0, 0, 4);").get();
+        e.execute_cql("insert into tmcr (p1, c1, c2, c3, r1) values (0, 1, 0, 1, 5);").get();
+        e.execute_cql("insert into tmcr (p1, c1, c2, c3, r1) values (0, 1, 1, 0, 6);").get();
+        e.execute_cql("insert into tmcr (p1, c1, c2, c3, r1) values (0, 1, 1, 1, 7);").get();
+        {
+            auto msg = e.execute_cql("select r1 from tmcr where p1 = 0 and (c1, c2, c3) = (0, 1, 1);").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(3)},
             });
-            return e.execute_cql("select r1 from tmcr where p1 = 0 and (c1, c2) = (0, 1);");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+        {
+            auto msg = e.execute_cql("select r1 from tmcr where p1 = 0 and (c1, c2) = (0, 1);").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(2)},
                 {int32_type->decompose(3)},
             });
-            return e.execute_cql("select r1 from tmcr where p1 = 0 and (c1, c2, c3) in ((0, 1, 0), (1, 0, 1), (0, 1, 0));");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+        {
+            auto msg = e.execute_cql("select r1 from tmcr where p1 = 0 and (c1, c2, c3) in ((0, 1, 0), (1, 0, 1), (0, 1, 0));").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(2)},
                 {int32_type->decompose(5)},
             });
-            return e.execute_cql("select r1 from tmcr where p1 = 0 and (c1, c2) in ((0, 1), (1, 0), (0, 1));");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+        {
+            auto msg = e.execute_cql("select r1 from tmcr where p1 = 0 and (c1, c2) in ((0, 1), (1, 0), (0, 1));").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(2)},
                 {int32_type->decompose(3)},
                 {int32_type->decompose(4)},
                 {int32_type->decompose(5)},
             });
-            return e.execute_cql("select r1 from tmcr where p1 = 0 and (c1, c2, c3) >= (1, 0, 1);");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+        {
+            auto msg = e.execute_cql("select r1 from tmcr where p1 = 0 and (c1, c2, c3) >= (1, 0, 1);").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(5)},
                 {int32_type->decompose(6)},
                 {int32_type->decompose(7)},
             });
-            return e.execute_cql("select r1 from tmcr where p1 = 0 and (c1, c2, c3) >= (0, 1, 1) and (c1, c2, c3) < (1, 1, 0);");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+        {
+            auto msg = e.execute_cql("select r1 from tmcr where p1 = 0 and (c1, c2, c3) >= (0, 1, 1) and (c1, c2, c3) < (1, 1, 0);").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(3)},
                 {int32_type->decompose(4)},
                 {int32_type->decompose(5)},
             });
-            return e.execute_cql("select r1 from tmcr where p1 = 0 and (c1, c2) >= (0, 1) and (c1, c2, c3) < (1, 0, 1);");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+        {
+            auto msg = e.execute_cql("select r1 from tmcr where p1 = 0 and (c1, c2) >= (0, 1) and (c1, c2, c3) < (1, 0, 1);").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(2)},
                 {int32_type->decompose(3)},
                 {int32_type->decompose(4)},
             });
-            return e.execute_cql("select r1 from tmcr where p1 = 0 and (c1, c2, c3) > (0, 1, 0) and (c1, c2) <= (0, 1);");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+        {
+            auto msg = e.execute_cql("select r1 from tmcr where p1 = 0 and (c1, c2, c3) > (0, 1, 0) and (c1, c2) <= (0, 1);").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(3)},
             });
-        });
+        }
     });
 }
 
 SEASTAR_TEST_CASE(test_select_distinct) {
-    return do_with_cql_env([] (cql_test_env& e) {
-        return e.execute_cql("create table tsd (p1 int, c1 int, r1 int, PRIMARY KEY (p1, c1));").discard_result().then([&e] {
-            e.require_table_exists("ks", "tsd");
-            return e.execute_cql("insert into tsd (p1, c1, r1) values (0, 0, 0);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tsd (p1, c1, r1) values (1, 1, 1);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tsd (p1, c1, r1) values (1, 1, 2);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tsd (p1, c1, r1) values (2, 2, 2);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tsd (p1, c1, r1) values (2, 3, 3);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("select distinct p1 from tsd;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        e.execute_cql("create table tsd (p1 int, c1 int, r1 int, PRIMARY KEY (p1, c1));").get();
+        e.require_table_exists("ks", "tsd").get();
+        e.execute_cql("insert into tsd (p1, c1, r1) values (0, 0, 0);").get();
+        e.execute_cql("insert into tsd (p1, c1, r1) values (1, 1, 1);").get();
+        e.execute_cql("insert into tsd (p1, c1, r1) values (1, 1, 2);").get();
+        e.execute_cql("insert into tsd (p1, c1, r1) values (2, 2, 2);").get();
+        e.execute_cql("insert into tsd (p1, c1, r1) values (2, 3, 3);").get();
+        {
+            auto msg = e.execute_cql("select distinct p1 from tsd;").get0();
             assert_that(msg).is_rows().with_size(3)
                 .with_row({int32_type->decompose(0)})
                 .with_row({int32_type->decompose(1)})
                 .with_row({int32_type->decompose(2)});
-            return e.execute_cql("select distinct p1 from tsd limit 3;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+        {
+            auto msg = e.execute_cql("select distinct p1 from tsd limit 3;").get0();
             assert_that(msg).is_rows().with_size(3)
                 .with_row({int32_type->decompose(0)})
                 .with_row({int32_type->decompose(1)})
                 .with_row({int32_type->decompose(2)});
-            return e.execute_cql("create table tsd2 (p1 int, p2 int, c1 int, r1 int, PRIMARY KEY ((p1, p2), c1));").discard_result();
-        }).then([&e] {
-            e.require_table_exists("ks", "tsd2");
-            return e.execute_cql("insert into tsd2 (p1, p2, c1, r1) values (0, 0, 0, 0);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tsd2 (p1, p2, c1, r1) values (0, 0, 1, 1);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tsd2 (p1, p2, c1, r1) values (1, 1, 0, 0);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tsd2 (p1, p2, c1, r1) values (1, 1, 1, 1);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tsd2 (p1, p2, c1, r1) values (2, 2, 0, 0);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tsd2 (p1, p2, c1, r1) values (2, 2, 1, 1);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("select distinct p1, p2 from tsd2;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+
+        e.execute_cql("create table tsd2 (p1 int, p2 int, c1 int, r1 int, PRIMARY KEY ((p1, p2), c1));").get();
+        e.require_table_exists("ks", "tsd2").get();
+        e.execute_cql("insert into tsd2 (p1, p2, c1, r1) values (0, 0, 0, 0);").get();
+        e.execute_cql("insert into tsd2 (p1, p2, c1, r1) values (0, 0, 1, 1);").get();
+        e.execute_cql("insert into tsd2 (p1, p2, c1, r1) values (1, 1, 0, 0);").get();
+        e.execute_cql("insert into tsd2 (p1, p2, c1, r1) values (1, 1, 1, 1);").get();
+        e.execute_cql("insert into tsd2 (p1, p2, c1, r1) values (2, 2, 0, 0);").get();
+        e.execute_cql("insert into tsd2 (p1, p2, c1, r1) values (2, 2, 1, 1);").get();
+        {
+            auto msg = e.execute_cql("select distinct p1, p2 from tsd2;").get0();
             assert_that(msg).is_rows().with_size(3)
                 .with_row({int32_type->decompose(0), int32_type->decompose(0)})
                 .with_row({int32_type->decompose(1), int32_type->decompose(1)})
                 .with_row({int32_type->decompose(2), int32_type->decompose(2)});
-            return e.execute_cql("select distinct p1, p2 from tsd2 limit 3;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+        {
+            auto msg = e.execute_cql("select distinct p1, p2 from tsd2 limit 3;").get0();
             assert_that(msg).is_rows().with_size(3)
                 .with_row({int32_type->decompose(0), int32_type->decompose(0)})
                 .with_row({int32_type->decompose(1), int32_type->decompose(1)})
                 .with_row({int32_type->decompose(2), int32_type->decompose(2)});
-            return e.execute_cql("create table tsd3 (p1 int, r1 int, PRIMARY KEY (p1));").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tsd3 (p1, r1) values (0, 0);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tsd3 (p1, r1) values (1, 1);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tsd3 (p1, r1) values (1, 2);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tsd3 (p1, r1) values (2, 2);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("select distinct p1 from tsd3;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+
+        e.execute_cql("create table tsd3 (p1 int, r1 int, PRIMARY KEY (p1));").get();
+        e.execute_cql("insert into tsd3 (p1, r1) values (0, 0);").get();
+        e.execute_cql("insert into tsd3 (p1, r1) values (1, 1);").get();
+        e.execute_cql("insert into tsd3 (p1, r1) values (1, 2);").get();
+        e.execute_cql("insert into tsd3 (p1, r1) values (2, 2);").get();
+        {
+            auto msg = e.execute_cql("select distinct p1 from tsd3;").get0();
             assert_that(msg).is_rows().with_size(3)
                 .with_row({int32_type->decompose(0)})
                 .with_row({int32_type->decompose(1)})
                 .with_row({int32_type->decompose(2)});
-            return e.execute_cql("create table tsd4 (p1 int, c1 int, s1 int static, r1 int, PRIMARY KEY (p1, c1));").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tsd4 (p1, c1, s1, r1) values (0, 0, 0, 0);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tsd4 (p1, c1, r1) values (0, 1, 1);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tsd4 (p1, s1) values (2, 1);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tsd4 (p1, s1) values (3, 2);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("select distinct p1, s1 from tsd4;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+
+        e.execute_cql("create table tsd4 (p1 int, c1 int, s1 int static, r1 int, PRIMARY KEY (p1, c1));").get();
+        e.execute_cql("insert into tsd4 (p1, c1, s1, r1) values (0, 0, 0, 0);").get();
+        e.execute_cql("insert into tsd4 (p1, c1, r1) values (0, 1, 1);").get();
+        e.execute_cql("insert into tsd4 (p1, s1) values (2, 1);").get();
+        e.execute_cql("insert into tsd4 (p1, s1) values (3, 2);").get();
+        {
+            auto msg = e.execute_cql("select distinct p1, s1 from tsd4;").get0();
             assert_that(msg).is_rows().with_size(3)
                 .with_row({int32_type->decompose(0), int32_type->decompose(0)})
                 .with_row({int32_type->decompose(2), int32_type->decompose(1)})
                 .with_row({int32_type->decompose(3), int32_type->decompose(2)});
-        });
+        }
     });
 }
 
@@ -2449,24 +2518,20 @@ APPLY BATCH;)"
 }
 
 SEASTAR_TEST_CASE(test_in_restriction) {
-    return do_with_cql_env([] (cql_test_env& e) {
-        return e.execute_cql("create table tir (p1 int, c1 int, r1 int, PRIMARY KEY (p1, c1));").discard_result().then([&e] {
-            e.require_table_exists("ks", "tir");
-            return e.execute_cql("insert into tir (p1, c1, r1) values (0, 0, 0);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tir (p1, c1, r1) values (1, 0, 1);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tir (p1, c1, r1) values (1, 1, 2);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tir (p1, c1, r1) values (1, 2, 3);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tir (p1, c1, r1) values (2, 3, 4);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("select * from tir where p1 in ();");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        e.execute_cql("create table tir (p1 int, c1 int, r1 int, PRIMARY KEY (p1, c1));").get();
+        e.require_table_exists("ks", "tir").get();
+        e.execute_cql("insert into tir (p1, c1, r1) values (0, 0, 0);").get();
+        e.execute_cql("insert into tir (p1, c1, r1) values (1, 0, 1);").get();
+        e.execute_cql("insert into tir (p1, c1, r1) values (1, 1, 2);").get();
+        e.execute_cql("insert into tir (p1, c1, r1) values (1, 2, 3);").get();
+        e.execute_cql("insert into tir (p1, c1, r1) values (2, 3, 4);").get();
+        {
+            auto msg = e.execute_cql("select * from tir where p1 in ();").get0();
             assert_that(msg).is_rows().with_size(0);
-            return e.execute_cql("select r1 from tir where p1 in (2, 0, 2, 1);");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+        {
+            auto msg = e.execute_cql("select r1 from tir where p1 in (2, 0, 2, 1);").get0();
             assert_that(msg).is_rows().with_rows_ignore_order({
                 {int32_type->decompose(4)},
                 {int32_type->decompose(0)},
@@ -2474,32 +2539,35 @@ SEASTAR_TEST_CASE(test_in_restriction) {
                 {int32_type->decompose(2)},
                 {int32_type->decompose(3)},
             });
-            return e.execute_cql("select r1 from tir where p1 = 1 and c1 in ();");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+        {
+            auto msg = e.execute_cql("select r1 from tir where p1 = 1 and c1 in ();").get0();
             assert_that(msg).is_rows().with_size(0);
-            return e.execute_cql("select r1 from tir where p1 = 1 and c1 in (2, 0, 2, 1);");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+        {
+            auto msg = e.execute_cql("select r1 from tir where p1 = 1 and c1 in (2, 0, 2, 1);").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(1)},
                 {int32_type->decompose(2)},
                 {int32_type->decompose(3)},
             });
-            return e.execute_cql("select r1 from tir where p1 = 1 and c1 in (2, 0, 2, 1) order by c1 desc;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+        {
+            auto msg = e.execute_cql("select r1 from tir where p1 = 1 and c1 in (2, 0, 2, 1) order by c1 desc;").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(3)},
                 {int32_type->decompose(2)},
                 {int32_type->decompose(1)},
             });
-            return e.prepare("select r1 from tir where p1 in ?;");
-        }).then([&e] (cql3::prepared_cache_key_type prepared_id){
+        }
+        {
+            auto prepared_id = e.prepare("select r1 from tir where p1 in ?;").get0();
             auto my_list_type = list_type_impl::get_instance(int32_type, true);
             std::vector<cql3::raw_value> raw_values;
             auto in_values_list = my_list_type->decompose(make_list_value(my_list_type,
                     list_type_impl::native_type{{int(2), int(0), int(2), int(1)}}));
             raw_values.emplace_back(cql3::raw_value::make_value(in_values_list));
-            return e.execute_prepared(prepared_id,raw_values);
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+            auto msg = e.execute_prepared(prepared_id,raw_values).get0();
             assert_that(msg).is_rows().with_rows_ignore_order({
                 {int32_type->decompose(4)},
                 {int32_type->decompose(0)},
@@ -2507,29 +2575,24 @@ SEASTAR_TEST_CASE(test_in_restriction) {
                 {int32_type->decompose(2)},
                 {int32_type->decompose(3)},
             });
-        }).then([&e]{
-            return e.execute_cql("create table tir2 (p1 int, c1 int, r1 int, PRIMARY KEY (p1, c1,r1));").discard_result();
-        }).then([&e] {
-            e.require_table_exists("ks", "tir2");
-            return e.execute_cql("insert into tir2 (p1, c1, r1) values (0, 0, 0);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tir2 (p1, c1, r1) values (1, 0, 1);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tir2 (p1, c1, r1) values (1, 1, 2);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tir2 (p1, c1, r1) values (1, 2, 3);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("insert into tir2 (p1, c1, r1) values (2, 3, 4);").discard_result();
-        }).then([&e] {
-            return e.execute_cql("select r1 from tir2 where (c1,r1) in ((0, 1),(1,2),(0,1),(1,2),(3,3)) ALLOW FILTERING;");
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+        }
+
+        e.execute_cql("create table tir2 (p1 int, c1 int, r1 int, PRIMARY KEY (p1, c1,r1));").get();
+        e.require_table_exists("ks", "tir2").get();
+        e.execute_cql("insert into tir2 (p1, c1, r1) values (0, 0, 0);").get();
+        e.execute_cql("insert into tir2 (p1, c1, r1) values (1, 0, 1);").get();
+        e.execute_cql("insert into tir2 (p1, c1, r1) values (1, 1, 2);").get();
+        e.execute_cql("insert into tir2 (p1, c1, r1) values (1, 2, 3);").get();
+        e.execute_cql("insert into tir2 (p1, c1, r1) values (2, 3, 4);").get();
+        {
+            auto msg = e.execute_cql("select r1 from tir2 where (c1,r1) in ((0, 1),(1,2),(0,1),(1,2),(3,3)) ALLOW FILTERING;").get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(1), int32_type->decompose(0)},
                 {int32_type->decompose(2), int32_type->decompose(1)},
             });
-        }).then([&e] {
-             return e.prepare("select r1 from tir2 where (c1,r1) in ? ALLOW FILTERING;");
-        }).then([&e] (cql3::prepared_cache_key_type prepared_id) {
+        }
+        {
+            auto prepared_id = e.prepare("select r1 from tir2 where (c1,r1) in ? ALLOW FILTERING;").get0();
             auto my_tuple_type = tuple_type_impl::get_instance({int32_type,int32_type});
             auto my_list_type = list_type_impl::get_instance(my_tuple_type, true);
             std::vector<tuple_type_impl::native_type> native_tuples = {
@@ -2547,13 +2610,12 @@ SEASTAR_TEST_CASE(test_in_restriction) {
             std::vector<cql3::raw_value> raw_values;
             auto in_values_list = my_list_type->decompose(make_list_value(my_list_type,tuples));
             raw_values.emplace_back(cql3::raw_value::make_value(in_values_list));
-            return e.execute_prepared(prepared_id,raw_values);
-        }).then([&e] (shared_ptr<cql_transport::messages::result_message> msg) {
+            auto msg = e.execute_prepared(prepared_id,raw_values).get0();
             assert_that(msg).is_rows().with_rows({
                 {int32_type->decompose(1), int32_type->decompose(0)},
                 {int32_type->decompose(2), int32_type->decompose(1)},
             });
-        });
+        }
     });
 }
 
@@ -3030,7 +3092,7 @@ SEASTAR_TEST_CASE(test_insert_large_collection_values) {
             BOOST_REQUIRE_THROW(e.execute_cql(format("INSERT INTO tbl (pk, m) VALUES ('Golding', {{'{}': 'value'}});", long_value)).get(), std::exception);
 
             auto make_query_options = [] (cql_protocol_version_type version) {
-                    return std::make_unique<cql3::query_options>(db::consistency_level::ONE, infinite_timeout_config, std::nullopt,
+                    return std::make_unique<cql3::query_options>(cql3::default_cql_config, db::consistency_level::ONE, infinite_timeout_config, std::nullopt,
                             std::vector<cql3::raw_value_view>(), false,
                             cql3::query_options::specific_options::DEFAULT, cql_serialization_format{version});
             };
@@ -3722,6 +3784,20 @@ void require_rows(cql_test_env& e,
     }
 }
 
+/// Asserts that e.execute_prepared(id, values) contains expected rows, in any order.
+void require_rows(cql_test_env& e,
+                  cql3::prepared_cache_key_type id,
+                  const std::vector<cql3::raw_value>& values,
+                  const std::vector<std::vector<bytes_opt>>& expected,
+                  const source_location& loc = source_location::current()) {
+    try {
+        assert_that(e.execute_prepared(id, values).get0()).is_rows().with_rows_ignore_order(expected);
+    } catch (const std::exception& e) {
+        BOOST_FAIL(format("execute_prepared failed: {}\n{}:{}: originally from here",
+                          e.what(), loc.file_name(), loc.line()));
+    }
+}
+
 auto I(int32_t x) { return int32_type->decompose(x); }
 
 auto L(int64_t x) { return long_type->decompose(x); }
@@ -3930,15 +4006,10 @@ SEASTAR_TEST_CASE(test_like_operator_bind_marker) {
     return do_with_cql_env_thread([] (cql_test_env& e) {
         cquery_nofail(e, "create table t (s text primary key, )");
         cquery_nofail(e, "insert into t (s) values ('abc')");
-        try {
-            auto result = e.execute_prepared(
-                    e.prepare("select s from t where s like ? allow filtering").get0(),
-                    {cql3::raw_value::make_value(T("_b_"))}).get0();
-            assert_that(result).is_rows().with_rows_ignore_order({{T("abc")}});
-        }
-        catch (const std::exception& e) {
-            BOOST_FAIL(e.what());
-        }
+        auto stmt = e.prepare("select s from t where s like ? allow filtering").get0();
+        require_rows(e, stmt, {cql3::raw_value::make_value(T("_b_"))}, {{T("abc")}});
+        require_rows(e, stmt, {cql3::raw_value::make_value(T("%g"))}, {});
+        require_rows(e, stmt, {cql3::raw_value::make_value(T("%c"))}, {{T("abc")}});
     });
 }
 
@@ -3968,31 +4039,39 @@ SEASTAR_TEST_CASE(test_like_operator_varchar) {
     });
 }
 
-SEASTAR_TEST_CASE(test_alter_type_on_compact_storage_with_no_regular_columns_does_not_crash) {
-    return do_with_cql_env_thread([] (cql_test_env& e) {
-        cquery_nofail(e, "CREATE TYPE my_udf (first text);");
-        cquery_nofail(e, "create table z (pk int, ck frozen<my_udf>, primary key(pk, ck)) with compact storage;");
-        cquery_nofail(e, "alter type my_udf add test_int int;");
-    });
-}
+namespace {
 
-SEASTAR_TEST_CASE(test_like_operator_on_nonstring) {
-    return do_with_cql_env_thread([] (cql_test_env& e) {
-        cquery_nofail(e, "create table t (k int primary key, s text)");
+/// Asserts that a column of type \p type cannot be LHS of the LIKE operator.
+auto assert_like_doesnt_accept(const char* type) {
+    return do_with_cql_env_thread([type] (cql_test_env& e) {
+        cquery_nofail(e, format("create table t (k {}, p int primary key)", type).c_str());
         BOOST_REQUIRE_EXCEPTION(
                 e.execute_cql("select * from t where k like 123 allow filtering").get(),
                 exceptions::invalid_request_exception,
                 exception_predicate::message_contains("only on string types"));
-#if 0 // TODO: Enable when query::result_set::consume() is fixed.
-        BOOST_REQUIRE_EXCEPTION(
-                e.execute_prepared(
-                        e.prepare("select s from t where s like ? allow filtering").get0(),
-                        {cql3::raw_value::make_value(I(1))}).get(),
-                exceptions::invalid_request_exception,
-                exception_predicate::message_contains("only on string types"));
-#endif
     });
 }
+
+} // anonymous namespace
+
+SEASTAR_TEST_CASE(test_like_operator_fails_on_bigint)    { return assert_like_doesnt_accept("bigint");    }
+SEASTAR_TEST_CASE(test_like_operator_fails_on_blob)      { return assert_like_doesnt_accept("blob");      }
+SEASTAR_TEST_CASE(test_like_operator_fails_on_boolean)   { return assert_like_doesnt_accept("boolean");   }
+SEASTAR_TEST_CASE(test_like_operator_fails_on_counter)   { return assert_like_doesnt_accept("counter");   }
+SEASTAR_TEST_CASE(test_like_operator_fails_on_decimal)   { return assert_like_doesnt_accept("decimal");   }
+SEASTAR_TEST_CASE(test_like_operator_fails_on_double)    { return assert_like_doesnt_accept("double");    }
+SEASTAR_TEST_CASE(test_like_operator_fails_on_duration)  { return assert_like_doesnt_accept("duration");  }
+SEASTAR_TEST_CASE(test_like_operator_fails_on_float)     { return assert_like_doesnt_accept("float");     }
+SEASTAR_TEST_CASE(test_like_operator_fails_on_inet)      { return assert_like_doesnt_accept("inet");      }
+SEASTAR_TEST_CASE(test_like_operator_fails_on_int)       { return assert_like_doesnt_accept("int");       }
+SEASTAR_TEST_CASE(test_like_operator_fails_on_smallint)  { return assert_like_doesnt_accept("smallint");  }
+SEASTAR_TEST_CASE(test_like_operator_fails_on_timestamp) { return assert_like_doesnt_accept("timestamp"); }
+SEASTAR_TEST_CASE(test_like_operator_fails_on_tinyint)   { return assert_like_doesnt_accept("tinyint");   }
+SEASTAR_TEST_CASE(test_like_operator_fails_on_uuid)      { return assert_like_doesnt_accept("uuid");      }
+SEASTAR_TEST_CASE(test_like_operator_fails_on_varint)    { return assert_like_doesnt_accept("varint");    }
+SEASTAR_TEST_CASE(test_like_operator_fails_on_timeuuid)  { return assert_like_doesnt_accept("timeuuid");  }
+SEASTAR_TEST_CASE(test_like_operator_fails_on_date)      { return assert_like_doesnt_accept("date");      }
+SEASTAR_TEST_CASE(test_like_operator_fails_on_time)      { return assert_like_doesnt_accept("time");      }
 
 SEASTAR_TEST_CASE(test_like_operator_on_token) {
     return do_with_cql_env_thread([] (cql_test_env& e) {
@@ -4001,5 +4080,89 @@ SEASTAR_TEST_CASE(test_like_operator_on_token) {
                 e.execute_cql("select * from t where token(s) like 'abc' allow filtering").get(),
                 exceptions::invalid_request_exception,
                 exception_predicate::message_contains("token function"));
+    });
+}
+
+SEASTAR_TEST_CASE(test_alter_type_on_compact_storage_with_no_regular_columns_does_not_crash) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        cquery_nofail(e, "CREATE TYPE my_udf (first text);");
+        cquery_nofail(e, "create table z (pk int, ck frozen<my_udf>, primary key(pk, ck)) with compact storage;");
+        cquery_nofail(e, "alter type my_udf add test_int int;");
+    });
+}
+
+SEASTAR_TEST_CASE(test_rf_expand) {
+    constexpr static auto simple = "org.apache.cassandra.locator.SimpleStrategy";
+    constexpr static auto network_topology = "org.apache.cassandra.locator.NetworkTopologyStrategy";
+
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        auto get_replication = [&] (const sstring& ks) {
+            auto msg = e.execute_cql(
+                format("SELECT JSON replication FROM system_schema.keyspaces WHERE keyspace_name = '{}'", ks)).get0();
+            auto res = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(msg);
+            auto rows = res->rs().result_set().rows();
+            BOOST_REQUIRE_EQUAL(rows.size(), 1);
+            auto row0 = rows[0];
+            BOOST_REQUIRE_EQUAL(row0.size(), 1);
+
+            return json::to_json_value(sstring(to_sstring_view(*row0[0])))["replication"];
+        };
+
+        auto assert_replication_contains = [&] (const sstring& ks, const std::map<sstring, sstring>& kvs) {
+            auto repl = get_replication(ks);
+            for (const auto& [k, v] : kvs) {
+                BOOST_REQUIRE_EQUAL(v, repl[k].asString());
+            }
+        };
+
+        auto assert_replication_not_contains = [&] (const sstring& ks, const std::vector<sstring>& keys) {
+            auto repl = get_replication(ks);
+            return std::none_of(keys.begin(), keys.end(), [&] (const sstring& k) {
+                return repl.isMember(std::string(k.begin(), k.end()));
+            });
+        };
+
+        e.execute_cql("CREATE KEYSPACE rf_expand_1 WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3}").get();
+        assert_replication_contains("rf_expand_1", {
+            {"class", network_topology},
+            {"datacenter1", "3"}
+        });
+
+        // The auto-expansion should not change existing replication factors.
+        e.execute_cql("ALTER KEYSPACE rf_expand_1 WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2}").get();
+        assert_replication_contains("rf_expand_1", {
+            {"class", network_topology},
+            {"datacenter1", "3"}
+        });
+
+        e.execute_cql("CREATE KEYSPACE rf_expand_2 WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}").get();
+        assert_replication_contains("rf_expand_2", {
+            {"class", simple},
+            {"replication_factor", "3"}
+        });
+
+        // Should auto-expand when switching from SimpleStrategy to NetworkTopologyStrategy without additional options.
+        e.execute_cql("ALTER KEYSPACE rf_expand_2 WITH replication = {'class': 'NetworkTopologyStrategy'}").get();
+        assert_replication_contains("rf_expand_2", {
+            {"class", network_topology},
+            {"datacenter1", "3"}
+        });
+
+        e.execute_cql("CREATE KEYSPACE rf_expand_3 WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}").get();
+        assert_replication_contains("rf_expand_3", {
+            {"class", simple},
+            {"replication_factor", "3"}
+        });
+
+        // Should not auto-expand when switching to NetworkTopologyStrategy with additional options.
+        e.execute_cql("ALTER KEYSPACE rf_expand_3 WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter2': 2}").get();
+        assert_replication_not_contains("rf_expand_3", {"datacenter1"});
+
+        // Respect factors specified manually.
+        e.execute_cql("CREATE KEYSPACE rf_expand_4 WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3, 'datacenter1': 2}").get();
+        assert_replication_contains("rf_expand_4", {
+            {"class", network_topology},
+            {"datacenter1", "2"}
+        });
     });
 }

@@ -713,12 +713,11 @@ bool abstract_type::is_string() const {
     return visit(*this, visitor{});
 }
 
-static bool find(const abstract_type& t, std::function<bool(const abstract_type&)> f) {
-    if (f(t)) {
-        return true;
-    }
+template<typename Predicate>
+GCC6_CONCEPT(requires CanHandleAllTypes<Predicate>)
+static bool find(const abstract_type& t, const Predicate& f) {
     struct visitor {
-        std::function<bool(const abstract_type&)>& f;
+        const Predicate& f;
         bool operator()(const abstract_type&) { return false; }
         bool operator()(const reversed_type_impl& r) { return find(*r.underlying_type(), f); }
         bool operator()(const tuple_type_impl& t) {
@@ -727,19 +726,28 @@ static bool find(const abstract_type& t, std::function<bool(const abstract_type&
         bool operator()(const map_type_impl& m) { return find(*m.get_keys_type(), f) || find(*m.get_values_type(), f); }
         bool operator()(const listlike_collection_type_impl& l) { return find(*l.get_elements_type(), f); }
     };
-    return visit(t, visitor{f});
+    return visit(t, [&](const auto& t) {
+        if (f(t)) {
+            return true;
+        }
+        return visitor{f}(t);
+    });
 }
 
 bool abstract_type::references_duration() const {
-    return find(*this, [] (const abstract_type& t) { return t.get_kind() == kind::duration; });
+    struct visitor {
+        bool operator()(const abstract_type&) const { return false; }
+        bool operator()(const duration_type_impl&) const { return true; }
+    };
+    return find(*this, visitor{});
 }
 
 bool abstract_type::references_user_type(const sstring& keyspace, const bytes& name) const {
     struct visitor {
         const sstring& keyspace;
         const bytes& name;
-        bool operator()(const abstract_type&) { return false; }
-        bool operator()(const user_type_impl& u) { return u._keyspace == keyspace && u._name == name; }
+        bool operator()(const abstract_type&) const { return false; }
+        bool operator()(const user_type_impl& u) const { return u._keyspace == keyspace && u._name == name; }
     };
     return find(*this, visitor{keyspace, name});
 }
@@ -752,7 +760,7 @@ struct is_byte_order_equal_visitor {
     bool operator()(const reversed_type_impl& t) { return t.underlying_type()->is_byte_order_equal(); }
     bool operator()(const string_type_impl&) { return true; }
     bool operator()(const bytes_type_impl&) { return true; }
-    bool operator()(const date_type_impl&) { return true; }
+    bool operator()(const timestamp_date_base_class&) { return true; }
     bool operator()(const inet_addr_type_impl&) { return true; }
     bool operator()(const duration_type_impl&) { return true; }
     // FIXME: origin returns false for list.  Why?
@@ -830,7 +838,6 @@ abstract_type::cql3_kind abstract_type::get_cql3_kind_impl() const {
         cql3_kind operator()(const bytes_type_impl&) { return cql3_kind::BLOB; }
         cql3_kind operator()(const boolean_type_impl&) { return cql3_kind::BOOLEAN; }
         cql3_kind operator()(const counter_type_impl&) { return cql3_kind::COUNTER; }
-        cql3_kind operator()(const date_type_impl&) { return cql3_kind::TIMESTAMP; }
         cql3_kind operator()(const decimal_type_impl&) { return cql3_kind::DECIMAL; }
         cql3_kind operator()(const double_type_impl&) { return cql3_kind::DOUBLE; }
         cql3_kind operator()(const duration_type_impl&) { return cql3_kind::DURATION; }
@@ -843,7 +850,7 @@ abstract_type::cql3_kind abstract_type::get_cql3_kind_impl() const {
         cql3_kind operator()(const simple_date_type_impl&) { return cql3_kind::DATE; }
         cql3_kind operator()(const utf8_type_impl&) { return cql3_kind::TEXT; }
         cql3_kind operator()(const time_type_impl&) { return cql3_kind::TIME; }
-        cql3_kind operator()(const timestamp_type_impl&) { return cql3_kind::TIMESTAMP; }
+        cql3_kind operator()(const timestamp_date_base_class&) { return cql3_kind::TIMESTAMP; }
         cql3_kind operator()(const timeuuid_type_impl&) { return cql3_kind::TIMEUUID; }
         cql3_kind operator()(const uuid_type_impl&) { return cql3_kind::UUID; }
         cql3_kind operator()(const varint_type_impl&) { return cql3_kind::VARINT; }
@@ -873,8 +880,7 @@ static sstring cql3_type_name_impl(const abstract_type& t) {
         sstring operator()(const byte_type_impl&) { return "tinyint"; }
         sstring operator()(const bytes_type_impl&) { return "blob"; }
         sstring operator()(const counter_type_impl&) { return "counter"; }
-        sstring operator()(const timestamp_type_impl&) { return "timestamp"; }
-        sstring operator()(const date_type_impl&) { return "timestamp"; }
+        sstring operator()(const timestamp_date_base_class&) { return "timestamp"; }
         sstring operator()(const decimal_type_impl&) { return "decimal"; }
         sstring operator()(const double_type_impl&) { return "double"; }
         sstring operator()(const duration_type_impl&) { return "duration"; }
@@ -1839,7 +1845,7 @@ struct validate_visitor {
             throw marshal_exception(format("Unsupported UUID version ({:d})", uuid.version()));
         }
     }
-    void operator()(const timestamp_type_impl& t) {
+    void operator()(const timestamp_date_base_class& t) {
         if (v.size() != 0 && v.size() != sizeof(uint64_t)) {
             throw marshal_exception(format("Validation failed for timestamp - got {:d} bytes", v.size()));
         }
@@ -1954,13 +1960,13 @@ struct serialize_visitor {
             *out++ = char(*v);
         }
     }
-    void operator()(const date_type_impl& t, const date_type_impl::native_type* v) {
-        if (v->empty()) {
+    void operator()(const timestamp_date_base_class& t, const timestamp_date_base_class::native_type* v1) {
+        if (v1->empty()) {
             return;
         }
-        int64_t i = v->get().time_since_epoch().count();
-        i = net::hton(uint64_t(i));
-        out = std::copy_n(reinterpret_cast<const char*>(&i), sizeof(i), out);
+        uint64_t v = v1->get().time_since_epoch().count();
+        v = net::hton(v);
+        out = std::copy_n(reinterpret_cast<const char*>(&v), sizeof(v), out);
     }
     void operator()(const timeuuid_type_impl& t, const timeuuid_type_impl::native_type* uuid1) {
         if (uuid1->empty()) {
@@ -1968,14 +1974,6 @@ struct serialize_visitor {
         }
         auto uuid = uuid1->get();
         uuid.serialize(out);
-    }
-    void operator()(const timestamp_type_impl& t, const timestamp_type_impl::native_type* v1) {
-        if (v1->empty()) {
-            return;
-        }
-        uint64_t v = v1->get().time_since_epoch().count();
-        v = net::hton(v);
-        out = std::copy_n(reinterpret_cast<const char*>(&v), sizeof(v), out);
     }
     void operator()(const simple_date_type_impl& t, const simple_date_type_impl::native_type* v1) {
         if (v1->empty()) {
@@ -2168,7 +2166,7 @@ static utils::UUID deserialize_value(const timeuuid_type_impl&, bytes_view v) {
     return deserialize_value(static_cast<const uuid_type_impl&>(*uuid_type), v);
 }
 
-static db_clock::time_point deserialize_value(const timestamp_type_impl&, bytes_view v) {
+static db_clock::time_point deserialize_value(const timestamp_date_base_class&, bytes_view v) {
     auto v2 = read_simple_exactly<uint64_t>(v);
     return db_clock::time_point(db_clock::duration(v2));
 }
@@ -2179,11 +2177,6 @@ static uint32_t deserialize_value(const simple_date_type_impl&, bytes_view v) {
 
 static int64_t deserialize_value(const time_type_impl&, bytes_view v) {
     return read_simple_exactly<int64_t>(v);
-}
-
-static db_clock::time_point deserialize_value(const date_type_impl&, bytes_view v) {
-    auto tmp = read_simple_exactly<uint64_t>(v);
-    return db_clock::time_point(db_clock::duration(tmp));
 }
 
 static bool deserialize_value(const boolean_type_impl&, bytes_view v) {
@@ -2261,7 +2254,10 @@ struct compare_visitor {
     int32_t operator()(const bytes_type_impl&) { return compare_unsigned(v1, v2); }
     int32_t operator()(const duration_type_impl&) { return compare_unsigned(v1, v2); }
     int32_t operator()(const inet_addr_type_impl&) { return compare_unsigned(v1, v2); }
-    int32_t operator()(const date_type_impl&) { return compare_unsigned(v1, v2); }
+    int32_t operator()(const date_type_impl&) {
+        // This is not the same behaviour as timestamp_type_impl
+        return compare_unsigned(v1, v2);
+    }
     int32_t operator()(const timeuuid_type_impl&) {
         if (v1.empty()) {
             return v2.empty() ? 0 : -1;
@@ -2484,7 +2480,7 @@ static size_t concrete_serialized_size(const long_type_impl::native_type&) { ret
 static size_t concrete_serialized_size(const float_type_impl::native_type&) { return sizeof(float); }
 static size_t concrete_serialized_size(const double_type_impl::native_type&) { return sizeof(double); }
 static size_t concrete_serialized_size(const boolean_type_impl::native_type&) { return 1; }
-static size_t concrete_serialized_size(const date_type_impl::native_type&) { return 8; }
+static size_t concrete_serialized_size(const timestamp_date_base_class::native_type&) { return 8; }
 static size_t concrete_serialized_size(const timeuuid_type_impl::native_type&) { return 16; }
 static size_t concrete_serialized_size(const simple_date_type_impl::native_type&) { return 4; }
 static size_t concrete_serialized_size(const string_type_impl::native_type& v) { return v.size(); }
@@ -2589,7 +2585,7 @@ struct from_string_visitor {
         }
         return v.serialize();
     }
-    bytes operator()(const timestamp_type_impl& t) {
+    bytes operator()(const timestamp_date_base_class& t) {
         if (s.empty()) {
             return bytes();
         }
@@ -2600,9 +2596,6 @@ struct from_string_visitor {
             return bytes();
         }
         return serialize_value(t, days_from_string(s));
-    }
-    bytes operator()(const date_type_impl& t) {
-        return serialize_value(t, db_clock::time_point(db_clock::duration(timestamp_from_string(s))));
     }
     bytes operator()(const time_type_impl& t) {
         if (s.empty()) {
@@ -2755,7 +2748,7 @@ struct to_string_impl_visitor {
         return format_if_not_empty(b, v, boolean_to_string);
     }
     sstring operator()(const counter_type_impl& c, const void*) { fail(unimplemented::cause::COUNTERS); }
-    sstring operator()(const date_type_impl& d, const date_type_impl::native_type* v) {
+    sstring operator()(const timestamp_date_base_class& d, const timestamp_date_base_class::native_type* v) {
         return format_if_not_empty(d, v, [] (const db_clock::time_point& v) { return time_point_to_string(v); });
     }
     sstring operator()(const decimal_type_impl& d, const decimal_type_impl::native_type* v) {
@@ -2788,9 +2781,6 @@ struct to_string_impl_visitor {
     }
     sstring operator()(const time_type_impl& t, const time_type_impl::native_type* v) {
         return format_if_not_empty(t, v, time_to_string);
-    }
-    sstring operator()(const timestamp_type_impl& t, const timestamp_type_impl::native_type* v) {
-        return format_if_not_empty(t, v, [] (const db_clock::time_point& v) { return time_point_to_string(v); });
     }
     sstring operator()(const timeuuid_type_impl& t, const timeuuid_type_impl::native_type* v) {
         return format_if_not_empty(t, v, [] (const utils::UUID& v) { return v.to_sstring(); });
@@ -2903,9 +2893,8 @@ struct to_json_string_visitor {
     sstring operator()(const string_type_impl& t) { return quote_json_string(t.to_string(bv)); }
     sstring operator()(const bytes_type_impl& t) { return quote_json_string("0x" + t.to_string(bv)); }
     sstring operator()(const boolean_type_impl& t) { return t.to_string(bv); }
-    sstring operator()(const date_type_impl& t) { return quote_json_string(t.to_string(bv)); }
+    sstring operator()(const timestamp_date_base_class& t) { return quote_json_string(t.to_string(bv)); }
     sstring operator()(const timeuuid_type_impl& t) { return quote_json_string(t.to_string(bv)); }
-    sstring operator()(const timestamp_type_impl& t) { return quote_json_string(t.to_string(bv)); }
     sstring operator()(const map_type_impl& t) { return to_json_string_aux(t, bv); }
     sstring operator()(const set_type_impl& t) { return to_json_string_aux(t, bv); }
     sstring operator()(const list_type_impl& t) { return to_json_string_aux(t, bv); }
@@ -3006,9 +2995,9 @@ struct from_json_object_visitor {
         }
         return t.decompose(value.asBool());
     }
-    bytes operator()(const date_type_impl& t) {
+    bytes operator()(const timestamp_date_base_class& t) {
         if (!value.isString() && !value.isIntegral()) {
-            throw marshal_exception("date_type must be represented as string or integer");
+            throw marshal_exception("timestamp_type must be represented as string or integer");
         }
         if (value.isIntegral()) {
             return long_type->decompose(json::to_int64_t(value));
@@ -3018,15 +3007,6 @@ struct from_json_object_visitor {
     bytes operator()(const timeuuid_type_impl& t) {
         if (!value.isString()) {
             throw marshal_exception(format("{} must be represented as string in JSON", value.toStyledString()));
-        }
-        return t.from_string(value.asString());
-    }
-    bytes operator()(const timestamp_type_impl& t) {
-        if (!value.isString() && !value.isIntegral()) {
-            throw marshal_exception("uuid_type must be represented as string or integer");
-        }
-        if (value.isIntegral()) {
-            return long_type->decompose(json::to_int64_t(value));
         }
         return t.from_string(value.asString());
     }
@@ -3114,8 +3094,7 @@ static bool is_value_compatible_with_internal(const abstract_type& t, const abst
         const abstract_type& other;
         bool operator()(const abstract_type& t) { return t.is_compatible_with(other); }
         bool operator()(const long_type_impl& t) { return is_date_long_or_timestamp(other); }
-        bool operator()(const date_type_impl& t) { return is_date_long_or_timestamp(other); }
-        bool operator()(const timestamp_type_impl& t) { return is_date_long_or_timestamp(other); }
+        bool operator()(const timestamp_date_base_class& t) { return is_date_long_or_timestamp(other); }
         bool operator()(const uuid_type_impl&) {
             return other.get_kind() == abstract_type::kind::uuid || other.get_kind() == abstract_type::kind::timeuuid;
         }
@@ -3465,7 +3444,7 @@ data_value::data_value(seastar::net::ipv6_address v) : data_value(seastar::net::
 data_value::data_value(simple_date_native_type v) : data_value(make_new(simple_date_type, v.days)) {
 }
 
-data_value::data_value(timestamp_native_type v) : data_value(make_new(timestamp_type, v.tp)) {
+data_value::data_value(db_clock::time_point v) : data_value(make_new(timestamp_type, v)) {
 }
 
 data_value::data_value(time_native_type v) : data_value(make_new(time_type, v.nanoseconds)) {
@@ -3474,7 +3453,7 @@ data_value::data_value(time_native_type v) : data_value(make_new(time_type, v.na
 data_value::data_value(timeuuid_native_type v) : data_value(make_new(timeuuid_type, v.uuid)) {
 }
 
-data_value::data_value(db_clock::time_point v) : data_value(make_new(date_type, v)) {
+data_value::data_value(date_type_native_type v) : data_value(make_new(date_type, v.tp)) {
 }
 
 data_value::data_value(boost::multiprecision::cpp_int v) : data_value(make_new(varint_type, v)) {
@@ -3544,12 +3523,42 @@ std::function<data_value(data_value)> make_castas_fctn_from_decimal_to_float() {
     };
 }
 
+static boost::multiprecision::cpp_int from_decimal_to_cppint(const data_value& from) {
+    const auto& val_from = value_cast<big_decimal>(from);
+    boost::multiprecision::cpp_int ten(10);
+    return val_from.unscaled_value() / boost::multiprecision::pow(ten, val_from.scale());
+}
+
+template <typename ToType>
+static ToType from_varint_to_integer(const boost::multiprecision::cpp_int& varint) {
+    // The behavior CQL expects on overflow is for values to wrap
+    // around. For cpp_int conversion functions, the behavior is to
+    // return the largest or smallest number that the target type can
+    // represent. To implement one with the other, we first mask the
+    // low 64 bits, convert to a uint64_t, and then let c++ convert,
+    // with possible overflow, to ToType.
+    return static_cast<uint64_t>(~static_cast<uint64_t>(0) & varint);
+}
+
+template<typename ToType>
+std::function<data_value(data_value)> make_castas_fctn_from_varint_to_integer() {
+    return [](data_value from) -> data_value {
+        const auto& varint = value_cast<boost::multiprecision::cpp_int>(from);
+        return from_varint_to_integer<ToType>(varint);
+    };
+}
+
 template<typename ToType>
 std::function<data_value(data_value)> make_castas_fctn_from_decimal_to_integer() {
     return [](data_value from) -> data_value {
-        auto val_from = value_cast<big_decimal>(from);
-        boost::multiprecision::cpp_int ten(10);
-        return static_cast<ToType>(val_from.unscaled_value() / boost::multiprecision::pow(ten, val_from.scale()));
+        auto varint = from_decimal_to_cppint(from);
+        return from_varint_to_integer<ToType>(varint);
+    };
+}
+
+std::function<data_value(data_value)> make_castas_fctn_from_decimal_to_varint() {
+    return [](data_value from) -> data_value {
+        return from_decimal_to_cppint(from);
     };
 }
 
@@ -3692,8 +3701,8 @@ thread_local castas_fctns_map castas_fctns {
     { {byte_type, long_type}, make_castas_fctn_simple<int8_t, int64_t>() },
     { {byte_type, float_type}, make_castas_fctn_simple<int8_t, float>() },
     { {byte_type, double_type}, make_castas_fctn_simple<int8_t, double>() },
-    { {byte_type, varint_type}, make_castas_fctn_simple<int8_t, boost::multiprecision::cpp_int>() },
-    { {byte_type, decimal_type}, make_castas_fctn_from_decimal_to_float<int8_t>() },
+    { {byte_type, varint_type}, make_castas_fctn_from_varint_to_integer<int8_t>() },
+    { {byte_type, decimal_type}, make_castas_fctn_from_decimal_to_integer<int8_t>() },
 
     { {short_type, byte_type}, make_castas_fctn_simple<int16_t, int8_t>() },
     { {short_type, short_type}, make_castas_fctn_simple<int16_t, int16_t>() },
@@ -3701,8 +3710,8 @@ thread_local castas_fctns_map castas_fctns {
     { {short_type, long_type}, make_castas_fctn_simple<int16_t, int64_t>() },
     { {short_type, float_type}, make_castas_fctn_simple<int16_t, float>() },
     { {short_type, double_type}, make_castas_fctn_simple<int16_t, double>() },
-    { {short_type, varint_type}, make_castas_fctn_simple<int16_t, boost::multiprecision::cpp_int>() },
-    { {short_type, decimal_type}, make_castas_fctn_from_decimal_to_float<int16_t>() },
+    { {short_type, varint_type}, make_castas_fctn_from_varint_to_integer<int16_t>() },
+    { {short_type, decimal_type}, make_castas_fctn_from_decimal_to_integer<int16_t>() },
 
     { {int32_type, byte_type}, make_castas_fctn_simple<int32_t, int8_t>() },
     { {int32_type, short_type}, make_castas_fctn_simple<int32_t, int16_t>() },
@@ -3710,8 +3719,8 @@ thread_local castas_fctns_map castas_fctns {
     { {int32_type, long_type}, make_castas_fctn_simple<int32_t, int64_t>() },
     { {int32_type, float_type}, make_castas_fctn_simple<int32_t, float>() },
     { {int32_type, double_type}, make_castas_fctn_simple<int32_t, double>() },
-    { {int32_type, varint_type}, make_castas_fctn_simple<int32_t, boost::multiprecision::cpp_int>() },
-    { {int32_type, decimal_type}, make_castas_fctn_from_decimal_to_float<int32_t>() },
+    { {int32_type, varint_type}, make_castas_fctn_from_varint_to_integer<int32_t>() },
+    { {int32_type, decimal_type}, make_castas_fctn_from_decimal_to_integer<int32_t>() },
 
     { {long_type, byte_type}, make_castas_fctn_simple<int64_t, int8_t>() },
     { {long_type, short_type}, make_castas_fctn_simple<int64_t, int16_t>() },
@@ -3719,8 +3728,8 @@ thread_local castas_fctns_map castas_fctns {
     { {long_type, long_type}, make_castas_fctn_simple<int64_t, int64_t>() },
     { {long_type, float_type}, make_castas_fctn_simple<int64_t, float>() },
     { {long_type, double_type}, make_castas_fctn_simple<int64_t, double>() },
-    { {long_type, varint_type}, make_castas_fctn_simple<int64_t, boost::multiprecision::cpp_int>() },
-    { {long_type, decimal_type}, make_castas_fctn_from_decimal_to_float<int64_t>() },
+    { {long_type, varint_type}, make_castas_fctn_from_varint_to_integer<int64_t>() },
+    { {long_type, decimal_type}, make_castas_fctn_from_decimal_to_integer<int64_t>() },
 
     { {float_type, byte_type}, make_castas_fctn_simple<float, int8_t>() },
     { {float_type, short_type}, make_castas_fctn_simple<float, int16_t>() },
@@ -3747,7 +3756,7 @@ thread_local castas_fctns_map castas_fctns {
     { {varint_type, float_type}, make_castas_fctn_simple<boost::multiprecision::cpp_int, float>() },
     { {varint_type, double_type}, make_castas_fctn_simple<boost::multiprecision::cpp_int, double>() },
     { {varint_type, varint_type}, make_castas_fctn_simple<boost::multiprecision::cpp_int, boost::multiprecision::cpp_int>() },
-    { {varint_type, decimal_type}, make_castas_fctn_from_decimal_to_integer<boost::multiprecision::cpp_int>() },
+    { {varint_type, decimal_type}, make_castas_fctn_from_decimal_to_varint() },
 
     { {decimal_type, byte_type}, make_castas_fctn_from_integer_to_decimal<int8_t>() },
     { {decimal_type, short_type}, make_castas_fctn_from_integer_to_decimal<int16_t>() },

@@ -158,6 +158,10 @@ public:
         _sst->_data_file_write_time = wtime;
     }
 
+    void set_run_identifier(utils::UUID identifier) {
+        _sst->_run_identifier = identifier;
+    }
+
     future<> store() {
         _sst->_recognized_components.erase(component_type::Index);
         _sst->_recognized_components.erase(component_type::Data);
@@ -633,7 +637,8 @@ public:
             , _listing(_f.list_directory([this] (directory_entry de) { return _remove(de); })) {
     }
     ~test_setup() {
-        _f.close().finally([save = _f] {});
+        // FIXME: discarded future.
+        (void)_f.close().finally([save = _f] {});
     }
 protected:
     future<> _create_directory(sstring name) {

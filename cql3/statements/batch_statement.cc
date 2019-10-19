@@ -43,25 +43,6 @@
 #include "database.hh"
 #include <seastar/core/execution_stage.hh>
 
-namespace {
-
-struct mutation_equals_by_key {
-    bool operator()(const mutation& m1, const mutation& m2) const {
-        return m1.schema() == m2.schema()
-                && m1.decorated_key().equal(*m1.schema(), m2.decorated_key());
-    }
-};
-
-struct mutation_hash_by_key {
-    size_t operator()(const mutation& m) const {
-        auto dk_hash = std::hash<dht::decorated_key>();
-        return dk_hash(m.decorated_key());
-    }
-};
-
-}
-
-
 namespace cql3 {
 
 namespace statements {
@@ -192,21 +173,21 @@ const std::vector<batch_statement::single_statement>& batch_statement::get_state
     return _statements;
 }
 
-future<std::vector<mutation>> batch_statement::get_mutations(service::storage_proxy& storage, const query_options& options, db::timeout_clock::time_point timeout, bool local, api::timestamp_type now, tracing::trace_state_ptr trace_state,
-                                                             service_permit permit) {
+future<std::vector<mutation>> batch_statement::get_mutations(service::storage_proxy& storage, const query_options& options,
+        db::timeout_clock::time_point timeout, bool local, api::timestamp_type now, service::query_state& query_state) {
     // Do not process in parallel because operations like list append/prepend depend on execution order.
     using mutation_set_type = std::unordered_set<mutation, mutation_hash_by_key, mutation_equals_by_key>;
-    return do_with(mutation_set_type(), [this, &storage, &options, timeout, now, local, trace_state, permit = std::move(permit)] (auto& result) mutable {
+    return do_with(mutation_set_type(), [this, &storage, &options, timeout, now, local, &query_state] (auto& result) mutable {
         result.reserve(_statements.size());
         _stats.statements_in_batches += _statements.size();
         return do_for_each(boost::make_counting_iterator<size_t>(0),
                            boost::make_counting_iterator<size_t>(_statements.size()),
-                           [this, &storage, &options, now, local, &result, timeout, trace_state, permit = std::move(permit)] (size_t i) {
+                           [this, &storage, &options, now, local, &result, timeout, &query_state] (size_t i) {
             auto&& statement = _statements[i].statement;
             statement->inc_cql_stats();
             auto&& statement_options = options.for_statement(i);
             auto timestamp = _attrs->get_timestamp(now, statement_options);
-            return statement->get_mutations(storage, statement_options, timeout, local, timestamp, trace_state, permit).then([&result] (auto&& more) {
+            return statement->get_mutations(storage, statement_options, timeout, local, timestamp, query_state).then([&result] (auto&& more) {
                 for (auto&& m : more) {
                     // We want unordered_set::try_emplace(), but we don't have it
                     auto pos = result.find(m);
@@ -296,7 +277,7 @@ future<shared_ptr<cql_transport::messages::result_message>> batch_statement::do_
     }
 
     auto timeout = db::timeout_clock::now() + options.get_timeout_config().*get_timeout_config_selector();
-    return get_mutations(storage, options, timeout, local, now, query_state.get_trace_state(), query_state.get_permit()).then([this, &storage, &options, timeout, tr_state = query_state.get_trace_state(),
+    return get_mutations(storage, options, timeout, local, now, query_state).then([this, &storage, &options, timeout, tr_state = query_state.get_trace_state(),
                                                                                                                                permit = query_state.get_permit()] (std::vector<mutation> ms) mutable {
         return execute_without_conditions(storage, std::move(ms), options.get_consistency(), timeout, std::move(tr_state), std::move(permit));
     }).then([] {
@@ -347,51 +328,6 @@ future<shared_ptr<cql_transport::messages::result_message>> batch_statement::exe
         service::query_state& state)
 {
     fail(unimplemented::cause::LWT);
-#if 0
-    auto now = state.get_timestamp();
-    ByteBuffer key = null;
-    String ksName = null;
-    String cfName = null;
-    CQL3CasRequest casRequest = null;
-    Set<ColumnDefinition> columnsWithConditions = new LinkedHashSet<>();
-
-    for (int i = 0; i < statements.size(); i++)
-    {
-        ModificationStatement statement = statements.get(i);
-        QueryOptions statementOptions = options.forStatement(i);
-        long timestamp = attrs.getTimestamp(now, statementOptions);
-        List<ByteBuffer> pks = statement.buildPartitionKeyNames(statementOptions);
-        if (pks.size() > 1)
-            throw new IllegalArgumentException("Batch with conditions cannot span multiple partitions (you cannot use IN on the partition key)");
-        if (key == null)
-        {
-            key = pks.get(0);
-            ksName = statement.cfm.ksName;
-            cfName = statement.cfm.cfName;
-            casRequest = new CQL3CasRequest(statement.cfm, key, true);
-        }
-        else if (!key.equals(pks.get(0)))
-        {
-            throw new InvalidRequestException("Batch with conditions cannot span multiple partitions");
-        }
-
-        Composite clusteringPrefix = statement.createClusteringPrefix(statementOptions);
-        if (statement.hasConditions())
-        {
-            statement.addConditions(clusteringPrefix, casRequest, statementOptions);
-            // As soon as we have a ifNotExists, we set columnsWithConditions to null so that everything is in the resultSet
-            if (statement.hasIfNotExistCondition() || statement.hasIfExistCondition())
-                columnsWithConditions = null;
-            else if (columnsWithConditions != null)
-                Iterables.addAll(columnsWithConditions, statement.getColumnsWithConditions());
-        }
-        casRequest.addRowUpdate(clusteringPrefix, statement, statementOptions, timestamp);
-    }
-
-    ColumnFamily result = StorageProxy.cas(ksName, cfName, key, casRequest, options.getSerialConsistency(), options.getConsistency(), state.getClientState());
-
-    return new ResultMessage.Rows(ModificationStatement.buildCasResultSet(ksName, key, cfName, result, columnsWithConditions, true, options.forStatement(0)));
-#endif
 }
 
 namespace raw {

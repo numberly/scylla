@@ -17,9 +17,17 @@ override_dh_auto_clean:
 
 override_dh_auto_install:
 	dh_auto_install
-	./install.sh --root "$(CURDIR)/debian/{{product}}-conf" $(install_arg) --target "stable" --pkg "conf" --disttype "debian"
-	./install.sh --root "$(CURDIR)/debian/{{product}}-kernel-conf" $(install_arg) --target "stable" --pkg "kernel-conf" --disttype "debian"
-	./install.sh --root "$(CURDIR)/debian/{{product}}-server" $(install_arg) --target "stable" --pkg "server" --disttype "debian"
+	./install.sh --root "$(CURDIR)/debian/{{product}}-conf" $(install_arg) --sysconfdir "/etc/default" --pkg "conf"
+	./install.sh --root "$(CURDIR)/debian/{{product}}-kernel-conf" $(install_arg) --sysconfdir "/etc/default" --pkg "kernel-conf"
+	./install.sh --root "$(CURDIR)/debian/{{product}}-server" $(install_arg) --sysconfdir "/etc/default" --pkg "server"
+{{#housekeeping}}
+	# XXX: since housekeeping.cfg is mistakenly belongs to different package
+	# in .rpm/.deb, we need this workaround to make package upgradable
+	mv $(CURDIR)/debian/{{product}}-conf/etc/scylla.d/housekeeping.cfg $(CURDIR)/debian/{{product}}-server/etc/scylla.d/housekeeping.cfg
+	rm -rf $(CURDIR)/debian/{{product}}-conf/etc/scylla.d
+{{/housekeeping}}
+	# don't use default sysconfig file, use Debian version
+	cp dist/debian/sysconfig/scylla-housekeeping $(CURDIR)/debian/{{product}}-server/etc/default/
 
 override_dh_installinit:
 {{#scylla}}
@@ -34,7 +42,9 @@ override_dh_installinit:
 	dh_installinit --no-start --name node-exporter
 
 override_dh_strip:
-	dh_strip -Xlibprotobuf.so.15 -Xld.so --dbg-package={{product}}-server-dbg
+	# The binaries (ethtool...patchelf) don't pass dh_strip after going through patchelf. Since they are
+	# already stripped, nothing is lost if we exclude them, so that's what we do.
+	dh_strip -Xlibprotobuf.so.15 -Xld.so -Xethtool -Xgawk -Xgzip -Xhwloc-calc -Xhwloc-distrib -Xifconfig -Xlscpu -Xnetstat -Xpatchelf --dbg-package={{product}}-server-dbg
 
 override_dh_makeshlibs:
 

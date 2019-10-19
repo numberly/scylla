@@ -81,12 +81,9 @@ void set_storage_proxy(http_context& ctx, routes& r) {
         return make_ready_future<json::json_return_type>(0);
     });
 
-    sp::get_hinted_handoff_enabled.set(r, [](std::unique_ptr<request> req)  {
-        //TBD
-        // FIXME
-        // hinted handoff is not supported currently,
-        // so we should return false
-        return make_ready_future<json::json_return_type>(false);
+    sp::get_hinted_handoff_enabled.set(r, [&ctx](std::unique_ptr<request> req)  {
+        auto enabled = ctx.db.local().get_config().hinted_handoff_enabled();
+        return make_ready_future<json::json_return_type>(enabled);
     });
 
     sp::set_hinted_handoff_enabled.set(r, [](std::unique_ptr<request> req)  {
@@ -303,12 +300,6 @@ void set_storage_proxy(http_context& ctx, routes& r) {
     });
 
     sp::get_cas_read_metrics_contention.set(r, [](std::unique_ptr<request> req) {
-        //TBD
-        unimplemented();
-        return make_ready_future<json::json_return_type>(0);
-    });
-
-    sp::get_cas_read_metrics_condition_not_met.set(r, [](std::unique_ptr<request> req) {
         //TBD
         unimplemented();
         return make_ready_future<json::json_return_type>(0);

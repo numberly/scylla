@@ -155,6 +155,12 @@ struct convert<db::config::seed_provider_type> {
 
 }
 
+#if defined(DEBUG)
+#define ENABLE_SSTABLE_KEY_VALIDATION true
+#else
+#define ENABLE_SSTABLE_KEY_VALIDATION false
+#endif
+
 #define str(x)  #x
 #define _mk_init(name, type, deflt, status, desc, ...)  , name(this, str(name), value_status::status, type(deflt), desc)
 
@@ -454,7 +460,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "The time that the coordinator waits for read operations to complete")
     , counter_write_request_timeout_in_ms(this, "counter_write_request_timeout_in_ms", value_status::Used, 5000,
         "The time that the coordinator waits for counter writes to complete.")
-    , cas_contention_timeout_in_ms(this, "cas_contention_timeout_in_ms", value_status::Unused, 5000,
+    , cas_contention_timeout_in_ms(this, "cas_contention_timeout_in_ms", value_status::Used, 1000,
         "The time that the coordinator continues to retry a CAS (compare and set) operation that contends with other proposals for the same row.")
     , truncate_request_timeout_in_ms(this, "truncate_request_timeout_in_ms", value_status::Used, 10000,
         "The time that the coordinator waits for truncates (remove all data from a table) to complete. The long default value allows for a snapshot to be taken before removing the data. If auto_snapshot is disabled (not recommended), you can reduce this time.")
@@ -678,6 +684,8 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , enable_keyspace_column_family_metrics(this, "enable_keyspace_column_family_metrics", value_status::Used, false, "Enable per keyspace and per column family metrics reporting")
     , enable_sstable_data_integrity_check(this, "enable_sstable_data_integrity_check", value_status::Used, false, "Enable interposer which checks for integrity of every sstable write."
         " Performance is affected to some extent as a result. Useful to help debugging problems that may arise at another layers.")
+    , enable_sstable_key_validation(this, "enable_sstable_key_validation", value_status::Used, ENABLE_SSTABLE_KEY_VALIDATION, "Enable validation of partition and clustering keys monotonicity"
+        " Performance is affected to some extent as a result. Useful to help debugging problems that may arise at another layers.")
     , cpu_scheduler(this, "cpu_scheduler", value_status::Used, true, "Enable cpu scheduling")
     , view_building(this, "view_building", value_status::Used, true, "Enable view building; should only be set to false when the node is experience issues due to view building")
     , enable_sstables_mc_format(this, "enable_sstables_mc_format", value_status::Used, true, "Enable SSTables 'mc' format to be used as the default file format")
@@ -686,6 +694,16 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , enable_shard_aware_drivers(this, "enable_shard_aware_drivers", value_status::Used, true, "Enable native transport drivers to use connection-per-shard for better performance")
     , enable_ipv6_dns_lookup(this, "enable_ipv6_dns_lookup", value_status::Used, false, "Use IPv6 address resolution")
     , abort_on_internal_error(this, "abort_on_internal_error", liveness::LiveUpdate, value_status::Used, false, "Abort the server instead of throwing exception when internal invariants are violated")
+    , max_partition_key_restrictions_per_query(this, "max_partition_key_restrictions_per_query", liveness::LiveUpdate, value_status::Used, 100,
+            "Maximum number of distinct partition keys restrictions per query. This limit places a bound on the size of IN tuples, "
+            "especially when multiple partition key columns have IN restrictions. Increasing this value can result in server instability.")
+    , max_clustering_key_restrictions_per_query(this, "max_clustering_key_restrictions_per_query", liveness::LiveUpdate, value_status::Used, 100,
+            "Maximum number of distinct clustering key restrictions per query. This limit places a bound on the size of IN tuples, "
+            "especially when multiple clustering key columns have IN restrictions. Increasing this value can result in server instability.")
+    , alternator_port(this, "alternator_port", value_status::Used, 0, "Alternator API port")
+    , alternator_https_port(this, "alternator_https_port", value_status::Used, 0, "Alternator API HTTPS port")
+    , alternator_address(this, "alternator_address", value_status::Used, "0.0.0.0", "Alternator API listening address")
+    , alternator_enforce_authorization(this, "alternator_enforce_authorization", value_status::Used, false, "Enforce checking the authorization header for every request in Alternator")
     , default_log_level(this, "default_log_level", value_status::Used)
     , logger_log_level(this, "logger_log_level", value_status::Used)
     , log_to_stdout(this, "log_to_stdout", value_status::Used)

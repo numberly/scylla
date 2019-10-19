@@ -262,6 +262,8 @@ static void insert_querier(
         return;
     }
 
+    ++stats.inserts;
+
     tracing::trace(trace_state, "Caching querier with key {}", key);
 
     auto memory_usage = boost::accumulate(entries | boost::adaptors::transformed(std::mem_fn(&querier_cache::entry::memory_usage)), size_t(0));
@@ -286,11 +288,11 @@ static void insert_querier(
 
     auto& e = entries.emplace_back(key, std::move(q), expires);
     e.set_pos(--entries.end());
+    ++stats.population;
 
     if (auto irh = sem.register_inactive_read(std::make_unique<querier_inactive_read>(entries, e.pos(), stats))) {
         e.set_inactive_handle(std::move(irh));
         index.insert(e);
-        ++stats.population;
     }
 }
 

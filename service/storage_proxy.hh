@@ -62,6 +62,15 @@
 #include "cache_temperature.hh"
 #include "mutation_query.hh"
 #include "service_permit.hh"
+#include "service/client_state.hh"
+
+
+namespace seastar::rpc {
+
+template <typename... T>
+class tuple;
+
+}
 
 namespace locator {
 
@@ -80,8 +89,14 @@ namespace service {
 class abstract_write_response_handler;
 class abstract_read_executor;
 class mutation_holder;
+class view_update_write_response_handler;
 
 using replicas_per_token_range = std::unordered_map<dht::token_range, std::vector<utils::UUID>>;
+
+struct query_partition_key_range_concurrent_result {
+    std::vector<foreign_ptr<lw_shared_ptr<query::result>>> result;
+    replicas_per_token_range replicas;
+};
 
 struct view_update_backlog_timestamped {
     db::view::update_backlog backlog;
@@ -138,6 +153,7 @@ private:
         ~unique_response_handler();
         response_id_type release();
     };
+    using response_handlers_map = std::unordered_map<response_id_type, ::shared_ptr<abstract_write_response_handler>>;
 
 public:
     static const sstring COORDINATOR_STATS_CATEGORY;
@@ -151,17 +167,20 @@ public:
 
     public:
         service_permit permit;
+        client_state& cstate;
         tracing::trace_state_ptr trace_state = nullptr;
         replicas_per_token_range preferred_replicas;
         std::optional<db::read_repair_decision> read_repair_decision;
 
         coordinator_query_options(clock_type::time_point timeout,
                 service_permit permit_,
+                client_state& client_state_,
                 tracing::trace_state_ptr trace_state = nullptr,
                 replicas_per_token_range preferred_replicas = { },
                 std::optional<db::read_repair_decision> read_repair_decision = { })
             : _timeout(timeout)
             , permit(std::move(permit_))
+            , cstate(client_state_)
             , trace_state(std::move(trace_state))
             , preferred_replicas(std::move(preferred_replicas))
             , read_repair_decision(read_repair_decision) {
@@ -191,7 +210,7 @@ private:
     smp_service_group _write_smp_service_group;
     smp_service_group _write_ack_smp_service_group;
     response_id_type _next_response_id;
-    std::unordered_map<response_id_type, ::shared_ptr<abstract_write_response_handler>> _response_handlers;
+    response_handlers_map _response_handlers;
     // This buffer hold ids of throttled writes in case resource consumption goes
     // below the threshold and we want to unthrottle some of them. Without this throttled
     // request with dead or slow replica may wait for up to timeout ms before replying
@@ -234,6 +253,7 @@ private:
             coordinator_query_options optional_params);
     response_id_type register_response_handler(shared_ptr<abstract_write_response_handler>&& h);
     void remove_response_handler(response_id_type id);
+    void remove_response_handler_entry(response_handlers_map::iterator entry);
     void got_response(response_id_type id, gms::inet_address from, std::optional<db::view::update_backlog> backlog);
     void got_failure_response(response_id_type id, gms::inet_address from, size_t count, std::optional<db::view::update_backlog> backlog);
     future<> response_wait(response_id_type id, clock_type::time_point timeout);
@@ -262,12 +282,12 @@ private:
             const std::vector<gms::inet_address>& preferred_endpoints,
             bool& is_bounced_read,
             service_permit permit);
-    future<foreign_ptr<lw_shared_ptr<query::result>>, cache_temperature> query_result_local(schema_ptr, lw_shared_ptr<query::read_command> cmd, const dht::partition_range& pr,
+    future<rpc::tuple<foreign_ptr<lw_shared_ptr<query::result>>, cache_temperature>> query_result_local(schema_ptr, lw_shared_ptr<query::read_command> cmd, const dht::partition_range& pr,
                                                                            query::result_options opts,
                                                                            tracing::trace_state_ptr trace_state,
                                                                            clock_type::time_point timeout,
                                                                            uint64_t max_size = query::result_memory_limiter::maximum_result_size);
-    future<query::result_digest, api::timestamp_type, cache_temperature> query_result_local_digest(schema_ptr, lw_shared_ptr<query::read_command> cmd, const dht::partition_range& pr,
+    future<rpc::tuple<query::result_digest, api::timestamp_type, cache_temperature>> query_result_local_digest(schema_ptr, lw_shared_ptr<query::read_command> cmd, const dht::partition_range& pr,
                                                                                                    tracing::trace_state_ptr trace_state,
                                                                                                    clock_type::time_point timeout,
                                                                                                    query::digest_algorithm da,
@@ -278,7 +298,7 @@ private:
             coordinator_query_options optional_params);
     float estimate_result_rows_per_range(lw_shared_ptr<query::read_command> cmd, keyspace& ks);
     static std::vector<gms::inet_address> intersection(const std::vector<gms::inet_address>& l1, const std::vector<gms::inet_address>& l2);
-    future<std::vector<foreign_ptr<lw_shared_ptr<query::result>>>, replicas_per_token_range> query_partition_key_range_concurrent(clock_type::time_point timeout,
+    future<query_partition_key_range_concurrent_result> query_partition_key_range_concurrent(clock_type::time_point timeout,
             std::vector<foreign_ptr<lw_shared_ptr<query::result>>>&& results,
             lw_shared_ptr<query::read_command> cmd,
             db::consistency_level cl,
@@ -307,7 +327,7 @@ private:
     void handle_read_error(std::exception_ptr eptr, bool range);
     template<typename Range>
     future<> mutate_internal(Range mutations, db::consistency_level cl, bool counter_write, tracing::trace_state_ptr tr_state, service_permit permit, std::optional<clock_type::time_point> timeout_opt = { });
-    future<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature> query_nonsingular_mutations_locally(
+    future<rpc::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>> query_nonsingular_mutations_locally(
             schema_ptr s, lw_shared_ptr<query::read_command> cmd, const dht::partition_range_vector&& pr, tracing::trace_state_ptr trace_state,
             uint64_t max_size, clock_type::time_point timeout);
 
@@ -436,20 +456,20 @@ public:
         db::consistency_level cl,
         coordinator_query_options optional_params);
 
-    future<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature> query_mutations_locally(
+    future<rpc::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>> query_mutations_locally(
         schema_ptr, lw_shared_ptr<query::read_command> cmd, const dht::partition_range&,
         clock_type::time_point timeout,
         tracing::trace_state_ptr trace_state = nullptr,
         uint64_t max_size = query::result_memory_limiter::maximum_result_size);
 
 
-    future<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature> query_mutations_locally(
+    future<rpc::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>> query_mutations_locally(
         schema_ptr, lw_shared_ptr<query::read_command> cmd, const ::compat::one_or_two_partition_ranges&,
         clock_type::time_point timeout,
         tracing::trace_state_ptr trace_state = nullptr,
         uint64_t max_size = query::result_memory_limiter::maximum_result_size);
 
-    future<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature> query_mutations_locally(
+    future<rpc::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>> query_mutations_locally(
             schema_ptr s, lw_shared_ptr<query::read_command> cmd, const dht::partition_range_vector& pr,
             clock_type::time_point timeout,
             tracing::trace_state_ptr trace_state = nullptr,
@@ -474,6 +494,7 @@ public:
     friend class abstract_write_response_handler;
     friend class speculating_read_executor;
     friend class view_update_backlog_broker;
+    friend class view_update_write_response_handler;
 };
 
 extern distributed<storage_proxy> _the_storage_proxy;

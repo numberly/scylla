@@ -61,6 +61,11 @@ GCC6_CONCEPT(
     concept bool PartitionFilter = requires(T filter, const dht::decorated_key& dk) {
         { filter(dk) } -> bool;
     };
+
+    template<typename T>
+    concept bool MutationFragmentFilter = requires(T filter, const mutation_fragment& mf) {
+        { filter(mf) } -> bool;
+    };
 )
 
 /*
@@ -177,7 +182,7 @@ public:
 
         template<typename Consumer, typename Filter>
         GCC6_CONCEPT(
-            requires FlatMutationReaderConsumer<Consumer>() && PartitionFilter<Filter>
+            requires FlatMutationReaderConsumer<Consumer>() && PartitionFilter<Filter> && MutationFragmentFilter<Filter>
         )
         // A variant of consume_pausable() that expects to be run in
         // a seastar::thread.
@@ -200,7 +205,7 @@ public:
                     next_partition();
                     continue;
                 }
-                if (consumer(std::move(mf)) == stop_iteration::yes) {
+                if (filter(mf) && (consumer(std::move(mf)) == stop_iteration::yes)) {
                     return;
                 }
             }
@@ -277,7 +282,7 @@ public:
 
         template<typename Consumer, typename Filter>
         GCC6_CONCEPT(
-            requires FlattenedConsumer<Consumer>() && PartitionFilter<Filter>
+            requires FlattenedConsumer<Consumer>() && PartitionFilter<Filter> && MutationFragmentFilter<Filter>
         )
         // A variant of consumee() that expects to be run in a seastar::thread.
         // Partitions for which filter(decorated_key) returns false are skipped
@@ -326,6 +331,7 @@ private:
     flat_mutation_reader() = default;
     explicit operator bool() const noexcept { return bool(_impl); }
     friend class optimized_optional<flat_mutation_reader>;
+    void do_upgrade_schema(const schema_ptr&);
 public:
     // Documented in mutation_reader::forwarding in mutation_reader.hh.
     class partition_range_forwarding_tag;
@@ -360,9 +366,50 @@ public:
         return _impl->consume(std::move(consumer), timeout);
     }
 
+    class filter {
+    private:
+        std::function<bool (const dht::decorated_key&)> _partition_filter = [] (const dht::decorated_key&) { return true; };
+        std::function<bool (const mutation_fragment&)> _mutation_fragment_filter = [] (const mutation_fragment&) { return true; };
+    public:
+        filter() = default;
+
+        filter(std::function<bool (const dht::decorated_key&)>&& pf)
+            : _partition_filter(std::move(pf))
+        { }
+
+        filter(std::function<bool (const dht::decorated_key&)>&& pf,
+               std::function<bool (const mutation_fragment&)>&& mf)
+            : _partition_filter(std::move(pf))
+            , _mutation_fragment_filter(std::move(mf))
+        { }
+
+        template <typename Functor>
+        filter(Functor&& f)
+            : _partition_filter(std::forward<Functor>(f))
+        { }
+
+        bool operator()(const dht::decorated_key& dk) const {
+            return _partition_filter(dk);
+        }
+
+        bool operator()(const mutation_fragment& mf) const {
+            return _mutation_fragment_filter(mf);
+        }
+    };
+
+    struct no_filter {
+        bool operator()(const dht::decorated_key& dk) const {
+            return true;
+        }
+
+        bool operator()(const mutation_fragment& mf) const {
+            return true;
+        }
+    };
+
     template<typename Consumer, typename Filter>
     GCC6_CONCEPT(
-        requires FlattenedConsumer<Consumer>() && PartitionFilter<Filter>
+        requires FlattenedConsumer<Consumer>() && PartitionFilter<Filter> && MutationFragmentFilter<Filter>
     )
     auto consume_in_thread(Consumer consumer, Filter filter, db::timeout_clock::time_point timeout) {
         return _impl->consume_in_thread(std::move(consumer), std::move(filter), timeout);
@@ -373,7 +420,7 @@ public:
         requires FlattenedConsumer<Consumer>()
     )
     auto consume_in_thread(Consumer consumer, db::timeout_clock::time_point timeout) {
-        return consume_in_thread(std::move(consumer), [] (const dht::decorated_key&) { return true; }, timeout);
+        return consume_in_thread(std::move(consumer), no_filter{}, timeout);
     }
 
     // Skips to the next partition.
@@ -473,6 +520,14 @@ public:
     // transformation to the fragment stream.
     void move_buffer_content_to(impl& other) {
         _impl->move_buffer_content_to(other);
+    }
+
+    // Causes this reader to conform to s.
+    // Multiple calls of upgrade_schema() compose, effects of prior calls on the stream are preserved.
+    void upgrade_schema(const schema_ptr& s) {
+        if (__builtin_expect(s != schema(), false)) {
+            do_upgrade_schema(s);
+        }
     }
 };
 
@@ -576,8 +631,12 @@ class delegating_reader : public flat_mutation_reader::impl {
 public:
     delegating_reader(Underlying&& r) : impl(to_reference(r).schema()), _underlying(std::forward<Underlying>(r)) { }
     virtual future<> fill_buffer(db::timeout_clock::time_point timeout) override {
-        return fill_buffer_from(to_reference(_underlying), timeout).then([this] (bool underlying_finished) {
-            _end_of_stream = underlying_finished;
+        if (is_buffer_full()) {
+            return make_ready_future<>();
+        }
+        return to_reference(_underlying).fill_buffer(timeout).then([this] {
+            _end_of_stream = to_reference(_underlying).is_end_of_stream();
+            to_reference(_underlying).move_buffer_content_to(*this);
         });
     }
     virtual future<> fast_forward_to(position_range pr, db::timeout_clock::time_point timeout) override {
@@ -685,3 +744,18 @@ future<> consume_partitions(flat_mutation_reader& reader, Consumer consumer, db:
 
 flat_mutation_reader
 make_generating_reader(schema_ptr s, std::function<future<mutation_fragment_opt> ()> get_next_fragment);
+
+// Track position_in_partition transitions and validate monotonicity.
+class mutation_fragment_stream_validator {
+    const schema& _schema;
+    mutation_fragment::kind _prev_kind;
+    position_in_partition _prev_pos;
+    partition_region _prev_region;
+    bool _compare_keys;
+public:
+    mutation_fragment_stream_validator(const schema& s, bool compare_keys = false);
+    ~mutation_fragment_stream_validator();
+
+    bool operator()(const dht::decorated_key& dk);
+    bool operator()(const mutation_fragment& mv);
+};
