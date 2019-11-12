@@ -102,9 +102,7 @@ auto write_dead_cell(Writer&& writer, atomic_cell_view c)
 template<typename Writer>
 auto write_collection_cell(Writer&& collection_writer, collection_mutation_view cmv, const column_definition& def)
 {
-  return cmv.data.with_linearized([&] (bytes_view cmv_bv) {
-    auto&& ctype = static_pointer_cast<const collection_type_impl>(def.type);
-    auto m_view = ctype->deserialize_mutation_form(cmv_bv);
+  return cmv.with_deserialized(*def.type, [&] (collection_mutation_view_description m_view) {
     auto cells_writer = std::move(collection_writer).write_tomb(m_view.tomb).start_elements();
     for (auto&& c : m_view.cells) {
         auto cell_writer = cells_writer.add().write_key(c.first);
@@ -202,7 +200,7 @@ template<typename Writer>
 void mutation_partition_serializer::write_serialized(Writer&& writer, const schema& s, const mutation_partition& mp)
 {
     auto srow_writer = std::move(writer).write_tomb(mp.partition_tombstone()).start_static_row();
-    auto row_tombstones = write_row_cells(std::move(srow_writer), mp.static_row(), s, column_kind::static_column).end_static_row().start_range_tombstones();
+    auto row_tombstones = write_row_cells(std::move(srow_writer), mp.static_row().get(), s, column_kind::static_column).end_static_row().start_range_tombstones();
     write_tombstones(s, row_tombstones, mp.row_tombstones());
     auto clustering_rows = std::move(row_tombstones).end_range_tombstones().start_rows();
     for (auto&& cr : mp.non_dummy_rows()) {

@@ -39,6 +39,8 @@
 #include "keys.hh"
 #include "clustering_bounds_comparator.hh"
 #include "range_tombstone.hh"
+#include "types/user.hh"
+#include "concrete_types.hh"
 
 namespace sstables {
 
@@ -237,7 +239,7 @@ private:
     class collection_mutation {
         const column_definition *_cdef;
     public:
-        collection_type_impl::mutation cm;
+        collection_mutation_description cm;
 
         // We need to get a copy of the prefix here, because the outer object may be short lived.
         collection_mutation(const column_definition *cdef)
@@ -256,8 +258,7 @@ private:
             if (!_cdef) {
                 return;
             }
-            auto ctype = static_pointer_cast<const collection_type_impl>(_cdef->type);
-            auto ac = atomic_cell_or_collection::from_collection_mutation(ctype->serialize_mutation_form(cm));
+            auto ac = atomic_cell_or_collection::from_collection_mutation(cm.serialize(*_cdef->type));
             if (_cdef->is_static()) {
                 mf.as_mutable_static_row().set_cell(*_cdef, std::move(ac));
             } else {
@@ -383,9 +384,10 @@ public:
                         const query::partition_slice& slice,
                         const io_priority_class& pc,
                         reader_resource_tracker resource_tracker,
+                        tracing::trace_state_ptr trace_state,
                         streamed_mutation::forwarding fwd,
                         const shared_sstable& sst)
-        : row_consumer(std::move(resource_tracker), pc)
+        : row_consumer(std::move(resource_tracker), std::move(trace_state), pc)
         , _reader(reader)
         , _schema(schema)
         , _slice(slice)
@@ -398,9 +400,10 @@ public:
                         const schema_ptr schema,
                         const io_priority_class& pc,
                         reader_resource_tracker resource_tracker,
+                        tracing::trace_state_ptr trace_state,
                         streamed_mutation::forwarding fwd,
                         const shared_sstable& sst)
-        : mp_row_consumer_k_l(reader, schema, schema->full_slice(), pc, std::move(resource_tracker), fwd, sst) { }
+        : mp_row_consumer_k_l(reader, schema, schema->full_slice(), pc, std::move(resource_tracker), std::move(trace_state), fwd, sst) { }
 
     virtual proceed consume_row_start(sstables::key_view key, sstables::deletion_time deltime) override {
         if (!_is_mutation_end) {
@@ -548,8 +551,27 @@ public:
                 return;
             }
             if (is_multi_cell) {
-                auto ctype = static_pointer_cast<const collection_type_impl>(col.cdef->type);
-                auto ac = make_atomic_cell(*ctype->value_comparator(),
+                auto& value_type = visit(*col.cdef->type, make_visitor(
+                    [] (const collection_type_impl& ctype) -> const abstract_type& { return *ctype.value_comparator(); },
+                    [&] (const user_type_impl& utype) -> const abstract_type& {
+                        if (col.collection_extra_data.size() != sizeof(int16_t)) {
+                            throw malformed_sstable_exception(format("wrong size of field index while reading UDT column: expected {}, got {}",
+                                        sizeof(int16_t), col.collection_extra_data.size()));
+                        }
+
+                        auto field_idx = deserialize_field_index(col.collection_extra_data);
+                        if (field_idx >= utype.size()) {
+                            throw malformed_sstable_exception(format("field index too big while reading UDT column: type has {} fields, got {}",
+                                        utype.size(), field_idx));
+                        }
+
+                        return *utype.type(field_idx);
+                    },
+                    [] (const abstract_type& o) -> const abstract_type& {
+                        throw malformed_sstable_exception(format("attempted to read multi-cell column, but expected type was {}", o.name()));
+                    }
+                ));
+                auto ac = make_atomic_cell(value_type,
                                            api::timestamp_type(timestamp),
                                            value,
                                            gc_clock::duration(ttl),
@@ -843,7 +865,7 @@ class mp_row_consumer_m : public consumer_m {
         atomic_cell_or_collection val;
     };
     std::vector<cell> _cells;
-    collection_type_impl::mutation _cm;
+    collection_mutation_description _cm;
 
     struct range_tombstone_start {
         clustering_key_prefix ck;
@@ -971,10 +993,11 @@ public:
                         const schema_ptr schema,
                         const query::partition_slice& slice,
                         const io_priority_class& pc,
-                            reader_resource_tracker resource_tracker,
+                        reader_resource_tracker resource_tracker,
+                        tracing::trace_state_ptr trace_state,
                         streamed_mutation::forwarding fwd,
                         const shared_sstable& sst)
-        : consumer_m(resource_tracker, pc)
+        : consumer_m(resource_tracker, std::move(trace_state), pc)
         , _reader(reader)
         , _schema(schema)
         , _slice(slice)
@@ -988,10 +1011,11 @@ public:
     mp_row_consumer_m(mp_row_consumer_reader* reader,
                         const schema_ptr schema,
                         const io_priority_class& pc,
-                            reader_resource_tracker resource_tracker,
+                        reader_resource_tracker resource_tracker,
+                        tracing::trace_state_ptr trace_state,
                         streamed_mutation::forwarding fwd,
                         const shared_sstable& sst)
-    : mp_row_consumer_m(reader, schema, schema->full_slice(), pc, std::move(resource_tracker), fwd, sst)
+    : mp_row_consumer_m(reader, schema, schema->full_slice(), pc, std::move(resource_tracker), std::move(trace_state), fwd, sst)
     { }
 
     virtual ~mp_row_consumer_m() {}
@@ -1186,9 +1210,28 @@ public:
         }
         check_schema_mismatch(column_info, column_def);
         if (column_def.is_multi_cell()) {
-            auto ctype = static_pointer_cast<const collection_type_impl>(column_def.type);
+            auto& value_type = visit(*column_def.type, make_visitor(
+                [] (const collection_type_impl& ctype) -> const abstract_type& { return *ctype.value_comparator(); },
+                [&] (const user_type_impl& utype) -> const abstract_type& {
+                    if (cell_path.size() != sizeof(int16_t)) {
+                        throw malformed_sstable_exception(format("wrong size of field index while reading UDT column: expected {}, got {}",
+                                    sizeof(int16_t), cell_path.size()));
+                    }
+
+                    auto field_idx = deserialize_field_index(cell_path);
+                    if (field_idx >= utype.size()) {
+                        throw malformed_sstable_exception(format("field index too big while reading UDT column: type has {} fields, got {}",
+                                    utype.size(), field_idx));
+                    }
+
+                    return *utype.type(field_idx);
+                },
+                [] (const abstract_type& o) -> const abstract_type& {
+                    throw malformed_sstable_exception(format("attempted to read multi-cell column, but expected type was {}", o.name()));
+                }
+            ));
             auto ac = is_deleted ? atomic_cell::make_dead(timestamp, local_deletion_time)
-                                 : make_atomic_cell(*ctype->value_comparator(),
+                                 : make_atomic_cell(value_type,
                                                     timestamp,
                                                     value,
                                                     ttl,
@@ -1222,9 +1265,7 @@ public:
             const column_definition& column_def = get_column_definition(column_id);
             if (!_cm.cells.empty() || (_cm.tomb && _cm.tomb.timestamp > column_def.dropped_at())) {
                 check_schema_mismatch(column_info, column_def);
-                auto ctype = static_pointer_cast<const collection_type_impl>(column_def.type);
-                auto ac = atomic_cell_or_collection::from_collection_mutation(ctype->serialize_mutation_form(_cm));
-                _cells.push_back({column_def.id, atomic_cell_or_collection(std::move(ac))});
+                _cells.push_back({column_def.id, _cm.serialize(*column_def.type)});
             }
         }
         _cm.tomb = {};

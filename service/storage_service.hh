@@ -262,10 +262,6 @@ private:
     /* Are we starting this node in bootstrap mode? */
     bool _is_bootstrap_mode;
 
-    /* we bootstrap but do NOT join the ring unless told to do so */
-    // FIXME: System.getProperty("cassandra.write_survey", "false")
-    bool _is_survey_mode = false;
-
     bool _initialized;
 
     bool _joined = false;
@@ -341,6 +337,8 @@ private:
     gms::feature _view_virtual_columns;
     gms::feature _digest_insensitive_to_expiry;
     gms::feature _computed_columns;
+    gms::feature _cdc_feature;
+    gms::feature _nonfrozen_udts;
 
     sstables::sstable_version_types _sstables_format = sstables::sstable_version_types::ka;
     seastar::semaphore _feature_listeners_sem = {1};
@@ -354,8 +352,6 @@ public:
         _is_bootstrap_mode = false;
     }
 
-    /** This method updates the local token on disk  */
-    void set_tokens(std::unordered_set<token> tokens);
     void set_gossip_tokens(const std::unordered_set<dht::token>& local_tokens);
 #if 0
 
@@ -552,9 +548,13 @@ private:
     void set_mode(mode m, bool log);
     void set_mode(mode m, sstring msg, bool log);
     void mark_existing_views_as_built();
-public:
-    void bootstrap(std::unordered_set<token> tokens);
 
+    // Stream data for which we become a new replica.
+    // Before that, if we're not replacing another node, inform other nodes about our chosen tokens (_bootstrap_tokens)
+    // and wait for RING_DELAY ms so that we receive new writes from coordinators during streaming.
+    void bootstrap();
+
+public:
     bool is_bootstrap_mode() {
         return _is_bootstrap_mode;
     }
@@ -2341,6 +2341,10 @@ public:
         return bool(_mc_sstable_feature);
     }
 
+    bool cluster_supports_cdc() const {
+        return bool(_cdc_feature);
+    }
+
     bool cluster_supports_row_level_repair() const {
         return bool(_row_level_repair_feature);
     }
@@ -2365,6 +2369,10 @@ public:
         return bool(_computed_columns);
     }
 
+    bool cluster_supports_nonfrozen_udts() const {
+        return bool(_nonfrozen_udts);
+    }
+
     // Returns schema features which all nodes in the cluster advertise as supported.
     db::schema_features cluster_schema_features() const;
 
@@ -2376,6 +2384,8 @@ private:
     void notify_up(inet_address endpoint);
     void notify_joined(inet_address endpoint);
     void notify_cql_change(inet_address endpoint, bool ready);
+public:
+    future<bool> is_cleanup_allowed(sstring keyspace);
 };
 
 future<> init_storage_service(sharded<abort_source>& abort_sources, distributed<database>& db, sharded<gms::gossiper>& gossiper, sharded<auth::service>& auth_service,

@@ -48,7 +48,7 @@ namespace cql3 {
 namespace statements {
 
 delete_statement::delete_statement(statement_type type, uint32_t bound_terms, schema_ptr s, std::unique_ptr<attributes> attrs, cql_stats& stats)
-        : modification_statement{type, bound_terms, std::move(s), std::move(attrs), &stats.deletes}
+        : modification_statement{type, bound_terms, std::move(s), std::move(attrs), stats}
 { }
 
 bool delete_statement::require_full_clustering_key() const {
@@ -101,7 +101,7 @@ delete_statement::prepare_internal(database& db, schema_ptr schema, shared_ptr<v
         op->collect_marker_specification(bound_names);
         stmt->add_operation(op);
     }
-
+    prepare_conditions(db, schema, bound_names, *stmt);
     stmt->process_where_clause(db, _where_clause, std::move(bound_names));
     if (!db.supports_infinite_bound_range_deletions()) {
         if (!stmt->restrictions()->get_clustering_columns_restrictions()->has_bound(bound::START)

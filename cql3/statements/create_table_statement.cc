@@ -51,10 +51,12 @@
 
 #include "auth/resource.hh"
 #include "auth/service.hh"
+#include "cdc/cdc.hh"
 #include "schema_builder.hh"
 #include "service/storage_service.hh"
 #include "db/extensions.hh"
 #include "database.hh"
+#include "types/user.hh"
 
 namespace cql3 {
 
@@ -96,25 +98,52 @@ std::vector<column_definition> create_table_statement::get_columns()
     return column_defs;
 }
 
-future<shared_ptr<cql_transport::event::schema_change>> create_table_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) {
-    return make_ready_future<>().then([this, is_local_only, &proxy] {
-        return service::get_local_migration_manager().announce_new_column_family(get_cf_meta_data(proxy.get_db().local()), is_local_only);
-    }).then_wrapped([this] (auto&& f) {
-        try {
-            f.get();
-            using namespace cql_transport;
-            return make_shared<event::schema_change>(
-                    event::schema_change::change_type::CREATED,
-                    event::schema_change::target_type::TABLE,
-                    this->keyspace(),
-                    this->column_family());
-        } catch (const exceptions::already_exists_exception& e) {
-            if (_if_not_exists) {
-                return ::shared_ptr<cql_transport::event::schema_change>();
-            }
-            throw e;
-        }
+template <typename CreateTable>
+future<shared_ptr<cql_transport::event::schema_change>>
+create_table_statement::create_table_with_cdc(service::storage_proxy& proxy,
+                                              schema_ptr schema,
+                                              CreateTable&& create_table) {
+    if (_if_not_exists) {
+        throw exceptions::invalid_request_exception(
+                "Can't create table with CDC support using IF NOT EXISTS");
+    }
+    cdc::db_context ctx = cdc::db_context::builder(proxy).build();
+    return cdc::setup(ctx, schema).then([ctx, create_table = std::move(create_table), schema = std::move(schema)] () mutable{
+        return create_table().handle_exception([ctx, schema = std::move(schema)](std::exception_ptr ep) mutable {
+            return cdc::remove(ctx, schema->ks_name(), schema->cf_name()).then([ep = std::move(ep)] () -> shared_ptr<cql_transport::event::schema_change> {
+                std::rethrow_exception(ep);
+            });
+        });
     });
+}
+
+future<shared_ptr<cql_transport::event::schema_change>> create_table_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) {
+    auto schema = get_cf_meta_data(proxy.get_db().local());
+    auto create_table = [this, is_local_only, schema] () mutable {
+        return make_ready_future<>().then([this, is_local_only, schema = std::move(schema)] {
+            return service::get_local_migration_manager().announce_new_column_family(std::move(schema), is_local_only);
+        }).then_wrapped([this] (auto&& f) {
+            try {
+                f.get();
+                using namespace cql_transport;
+                return make_shared<event::schema_change>(
+                        event::schema_change::change_type::CREATED,
+                        event::schema_change::target_type::TABLE,
+                        this->keyspace(),
+                        this->column_family());
+            } catch (const exceptions::already_exists_exception& e) {
+                if (_if_not_exists) {
+                    return ::shared_ptr<cql_transport::event::schema_change>();
+                }
+                throw e;
+            }
+        });
+    };
+    bool cdc_enabled = _properties->get_cdc_options() && cdc::options(*_properties->get_cdc_options()).enabled();
+    return cdc_enabled
+            ? create_table_with_cdc(
+                    proxy, std::move(schema), std::move(create_table))
+            : create_table();
 }
 
 /**
@@ -205,18 +234,34 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
 
     auto stmt = ::make_shared<create_table_statement>(_cf_name, _properties.properties(), _if_not_exists, _static_columns, _properties.properties()->get_id());
 
-    std::optional<std::map<bytes, data_type>> defined_multi_cell_collections;
+    std::optional<std::map<bytes, data_type>> defined_multi_cell_columns;
     for (auto&& entry : _definitions) {
         ::shared_ptr<column_identifier> id = entry.first;
         cql3_type pt = entry.second->prepare(db, keyspace());
         if (pt.is_counter() && !service::get_local_storage_service().cluster_supports_counters()) {
             throw exceptions::invalid_request_exception("Counter support is not enabled");
         }
-        if (pt.is_collection() && pt.get_type()->is_multi_cell()) {
-            if (!defined_multi_cell_collections) {
-                defined_multi_cell_collections = std::map<bytes, data_type>{};
+        if (pt.get_type()->is_multi_cell()) {
+            if (pt.get_type()->is_user_type()) {
+                // check for multi-cell types (non-frozen UDTs or collections) inside a non-frozen UDT
+                auto type = static_cast<const user_type_impl*>(pt.get_type().get());
+                for (auto&& inner: type->all_types()) {
+                    if (inner->is_multi_cell()) {
+                        // a nested non-frozen UDT should have already been rejected when defining the type
+                        assert(inner->is_collection());
+                        throw exceptions::invalid_request_exception("Non-frozen UDTs with nested non-frozen collections are not supported");
+                    }
+                }
+
+                if (!service::get_local_storage_service().cluster_supports_nonfrozen_udts()) {
+                    throw exceptions::invalid_request_exception("Non-frozen UDT support is not enabled");
+                }
             }
-            defined_multi_cell_collections->emplace(id->name(), pt.get_type());
+
+            if (!defined_multi_cell_columns) {
+                defined_multi_cell_columns = std::map<bytes, data_type>{};
+            }
+            defined_multi_cell_columns->emplace(id->name(), pt.get_type());
         }
         stmt->_columns.emplace(id, pt.get_type()); // we'll remove what is not a column below
     }
@@ -253,8 +298,8 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
             if (stmt->_columns.empty()) {
                 throw exceptions::invalid_request_exception("No definition found that is not part of the PRIMARY KEY");
             }
-            if (defined_multi_cell_collections) {
-                throw exceptions::invalid_request_exception("Non-frozen collection types are not supported with COMPACT STORAGE");
+            if (defined_multi_cell_columns) {
+                throw exceptions::invalid_request_exception("Non-frozen collections and UDTs are not supported with COMPACT STORAGE");
             }
         }
         stmt->_clustering_key_types = std::vector<data_type>{};
@@ -262,8 +307,8 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
         // If we use compact storage and have only one alias, it is a
         // standard "dynamic" CF, otherwise it's a composite
         if (_properties.use_compact_storage() && _column_aliases.size() == 1) {
-            if (defined_multi_cell_collections) {
-                throw exceptions::invalid_request_exception("Collection types are not supported with COMPACT STORAGE");
+            if (defined_multi_cell_columns) {
+                throw exceptions::invalid_request_exception("Non-frozen collections and UDTs are not supported with COMPACT STORAGE");
             }
             auto alias = _column_aliases[0];
             if (_static_columns.count(alias) > 0) {
@@ -296,8 +341,8 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
             }
 
             if (_properties.use_compact_storage()) {
-                if (defined_multi_cell_collections) {
-                    throw exceptions::invalid_request_exception("Collection types are not supported with COMPACT STORAGE");
+                if (defined_multi_cell_columns) {
+                    throw exceptions::invalid_request_exception("Non-frozen collections and UDTs are not supported with COMPACT STORAGE");
                 }
                 stmt->_clustering_key_types = types;
             } else {
@@ -387,8 +432,12 @@ data_type create_table_statement::raw_statement::get_type_and_remove(column_map_
         throw exceptions::invalid_request_exception(format("Unknown definition {} referenced in PRIMARY KEY", t->text()));
     }
     auto type = it->second;
-    if (type->is_collection() && type->is_multi_cell()) {
-        throw exceptions::invalid_request_exception(format("Invalid collection type for PRIMARY KEY component {}", t->text()));
+    if (type->is_multi_cell()) {
+        if (type->is_collection()) {
+            throw exceptions::invalid_request_exception(format("Invalid non-frozen collection type for PRIMARY KEY component {}", t->text()));
+        } else {
+            throw exceptions::invalid_request_exception(format("Invalid non-frozen user-defined type for PRIMARY KEY component {}", t->text()));
+        }
     }
     columns.erase(t);
 

@@ -59,9 +59,7 @@ void memtable::memtable_encoding_stats_collector::update(const ::schema& s, cons
         if (col.is_atomic()) {
             update(item.as_atomic_cell(col));
         } else {
-            auto ctype = static_pointer_cast<const collection_type_impl>(col.type);
-            item.as_collection_mutation().data.with_linearized([&] (bytes_view bv) {
-            auto mview = ctype->deserialize_mutation_form(bv);
+            item.as_collection_mutation().with_deserialized(*col.type, [&] (collection_mutation_view_description mview) {
             // Note: when some of the collection cells are dead and some are live
             // we need to encode a "live" deletion_time for the living ones.
             // It is not strictly required to update encoding_stats for the latter case
@@ -103,7 +101,7 @@ void memtable::memtable_encoding_stats_collector::update(const ::schema& s, cons
 
 void memtable::memtable_encoding_stats_collector::update(const ::schema& s, const mutation_partition& mp) {
     update(mp.partition_tombstone());
-    update(s, mp.static_row(), column_kind::static_column);
+    update(s, mp.static_row().get(), column_kind::static_column);
     for (auto&& row_entry : mp.clustered_rows()) {
         update(s, row_entry.row());
     }

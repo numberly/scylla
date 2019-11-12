@@ -235,6 +235,16 @@ statement_restrictions::statement_restrictions(database& db,
         _index_restrictions.push_back(_partition_key_restrictions);
     }
 
+    // If the only updated/deleted columns are static, then we don't need clustering columns.
+    // And in fact, unless it is an INSERT, we reject if clustering columns are provided as that
+    // suggest something unintended. For instance, given:
+    //   CREATE TABLE t (k int, v int, s int static, PRIMARY KEY (k, v))
+    // it can make sense to do:
+    //   INSERT INTO t(k, v, s) VALUES (0, 1, 2)
+    // but both
+    //   UPDATE t SET s = 3 WHERE k = 0 AND v = 1
+    //   DELETE s FROM t WHERE k = 0 AND v = 1
+    // sounds like you don't really understand what your are doing.
     if (selects_only_static_columns && has_clustering_columns_restriction()) {
         if (type.is_update() || type.is_delete()) {
             throw exceptions::invalid_request_exception(format("Invalid restrictions on clustering columns since the {} statement modifies only static columns", type));
@@ -706,7 +716,7 @@ bool single_column_restriction::contains::is_satisfied_by(const schema& schema,
         return false;
     }
 
-    auto col_type = static_pointer_cast<const collection_type_impl>(_column_def.type);
+    auto col_type = static_cast<const collection_type_impl*>(_column_def.type.get());
     if ((!_keys.empty() || !_entry_keys.empty()) && !col_type->is_map()) {
         return false;
     }
@@ -716,8 +726,8 @@ bool single_column_restriction::contains::is_satisfied_by(const schema& schema,
     auto&& element_type = col_type->is_set() ? col_type->name_comparator() : col_type->value_comparator();
     if (_column_def.type->is_multi_cell()) {
         auto cell = cells.find_cell(_column_def.id);
-      return cell->as_collection_mutation().data.with_linearized([&] (bytes_view collection_bv) {
-        auto&& elements = col_type->deserialize_mutation_form(collection_bv).cells;
+      return cell->as_collection_mutation().with_deserialized(*col_type, [&] (collection_mutation_view_description mv) {
+        auto&& elements = mv.cells;
         auto end = std::remove_if(elements.begin(), elements.end(), [now] (auto&& element) {
             return element.second.is_dead(now);
         });
@@ -790,6 +800,7 @@ bool single_column_restriction::contains::is_satisfied_by(const schema& schema,
 }
 
 bool single_column_restriction::contains::is_satisfied_by(bytes_view collection_bv, const query_options& options) const {
+    assert(_column_def.type->is_collection());
     auto col_type = static_pointer_cast<const collection_type_impl>(_column_def.type);
     if (collection_bv.empty() || ((!_keys.empty() || !_entry_keys.empty()) && !col_type->is_map())) {
         return false;

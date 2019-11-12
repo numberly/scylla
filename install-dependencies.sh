@@ -22,6 +22,7 @@
 bash seastar/install-dependencies.sh
 
 debian_base_packages=(
+    liblua5.3-dev
     python3-pyparsing
     libsnappy-dev
     libjsoncpp-dev
@@ -31,9 +32,11 @@ debian_base_packages=(
     thrift-compiler
     git
     pigz
+    libunistring-dev
 )
 
 fedora_packages=(
+    lua-devel
     yaml-cpp-devel
     thrift-devel
     antlr3-tool

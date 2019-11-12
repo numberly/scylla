@@ -524,6 +524,7 @@ usingClauseObjective[::shared_ptr<cql3::attributes::raw> attrs]
  */
 updateStatement returns [::shared_ptr<raw::update_statement> expr]
     @init {
+        bool if_exists = false;
         auto attrs = ::make_shared<cql3::attributes::raw>();
         std::vector<std::pair<::shared_ptr<cql3::column_identifier::raw>, ::shared_ptr<cql3::operation::raw_update>>> operations;
     }
@@ -531,13 +532,14 @@ updateStatement returns [::shared_ptr<raw::update_statement> expr]
       ( usingClause[attrs] )?
       K_SET columnOperation[operations] (',' columnOperation[operations])*
       K_WHERE wclause=whereClause
-      ( K_IF conditions=updateConditions )?
+      ( K_IF (K_EXISTS{ if_exists = true; } | conditions=updateConditions) )?
       {
           return ::make_shared<raw::update_statement>(std::move(cf),
                                                   std::move(attrs),
                                                   std::move(operations),
                                                   std::move(wclause),
-                                                  std::move(conditions));
+                                                  std::move(conditions),
+                                                  if_exists);
      }
     ;
 
@@ -581,6 +583,7 @@ deleteSelection returns [std::vector<::shared_ptr<cql3::operation::raw_deletion>
 deleteOp returns [::shared_ptr<cql3::operation::raw_deletion> op]
     : c=cident                { $op = ::make_shared<cql3::operation::column_deletion>(std::move(c)); }
     | c=cident '[' t=term ']' { $op = ::make_shared<cql3::operation::element_deletion>(std::move(c), std::move(t)); }
+    | c=cident '.' field=ident { $op = ::make_shared<cql3::operation::field_deletion>(std::move(c), std::move(field)); }
     ;
 
 usingClauseDelete[::shared_ptr<cql3::attributes::raw> attrs]
@@ -1396,8 +1399,9 @@ columnOperation[operations_type& operations]
 
 columnOperationDifferentiator[operations_type& operations, ::shared_ptr<cql3::column_identifier::raw> key]
     : '=' normalColumnOperation[operations, key]
-    | '[' k=term ']' specializedColumnOperation[operations, key, k, false]
-    | '[' K_SCYLLA_TIMEUUID_LIST_INDEX '(' k=term ')' ']' specializedColumnOperation[operations, key, k, true]
+    | '[' k=term ']' collectionColumnOperation[operations, key, k, false]
+    | '.' field=ident udtColumnOperation[operations, key, field]
+    | '[' K_SCYLLA_TIMEUUID_LIST_INDEX '(' k=term ')' ']' collectionColumnOperation[operations, key, k, true]
     ;
 
 normalColumnOperation[operations_type& operations, ::shared_ptr<cql3::column_identifier::raw> key]
@@ -1440,31 +1444,38 @@ normalColumnOperation[operations_type& operations, ::shared_ptr<cql3::column_ide
       }
     ;
 
-specializedColumnOperation[std::vector<std::pair<shared_ptr<cql3::column_identifier::raw>,
-                                                 shared_ptr<cql3::operation::raw_update>>>& operations,
-                           shared_ptr<cql3::column_identifier::raw> key,
-                           shared_ptr<cql3::term::raw> k,
-                           bool by_uuid]
-
+collectionColumnOperation[operations_type& operations,
+                          shared_ptr<cql3::column_identifier::raw> key,
+                          shared_ptr<cql3::term::raw> k,
+                          bool by_uuid]
     : '=' t=term
       {
           add_raw_update(operations, key, make_shared<cql3::operation::set_element>(k, t, by_uuid));
       }
     ;
 
+udtColumnOperation[operations_type& operations,
+                   shared_ptr<cql3::column_identifier::raw> key,
+                   shared_ptr<cql3::column_identifier> field]
+    : '=' t=term
+      {
+          add_raw_update(operations, std::move(key), make_shared<cql3::operation::set_field>(std::move(field), std::move(t)));
+      }
+    ;
+
 columnCondition[conditions_type& conditions]
     // Note: we'll reject duplicates later
     : key=cident
-        ( op=relationType t=term { conditions.emplace_back(key, cql3::column_condition::raw::simple_condition(t, *op)); }
+        ( op=relationType t=term { conditions.emplace_back(key, cql3::column_condition::raw::simple_condition(t, {}, *op)); }
         | K_IN
-            ( values=singleColumnInValues { conditions.emplace_back(key, cql3::column_condition::raw::simple_in_condition(values)); }
-            | marker=inMarker { conditions.emplace_back(key, cql3::column_condition::raw::simple_in_condition(marker)); }
+            ( values=singleColumnInValues { conditions.emplace_back(key, cql3::column_condition::raw::in_condition({}, {}, values)); }
+            | marker=inMarker { conditions.emplace_back(key, cql3::column_condition::raw::in_condition({}, marker, {})); }
             )
         | '[' element=term ']'
-            ( op=relationType t=term { conditions.emplace_back(key, cql3::column_condition::raw::collection_condition(t, element, *op)); }
+            ( op=relationType t=term { conditions.emplace_back(key, cql3::column_condition::raw::simple_condition(t, element, *op)); }
             | K_IN
-                ( values=singleColumnInValues { conditions.emplace_back(key, cql3::column_condition::raw::collection_in_condition(element, values)); }
-                | marker=inMarker { conditions.emplace_back(key, cql3::column_condition::raw::collection_in_condition(element, marker)); }
+                ( values=singleColumnInValues { conditions.emplace_back(key, cql3::column_condition::raw::in_condition(element, {}, values)); }
+                | marker=inMarker { conditions.emplace_back(key, cql3::column_condition::raw::in_condition(element, marker, {})); }
                 )
             )
         )

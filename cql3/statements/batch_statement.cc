@@ -40,8 +40,10 @@
 #include "batch_statement.hh"
 #include "raw/batch_statement.hh"
 #include "db/config.hh"
+#include "db/consistency_level_validations.hh"
 #include "database.hh"
 #include <seastar/core/execution_stage.hh>
+#include "cas_request.hh"
 
 namespace cql3 {
 
@@ -60,12 +62,20 @@ batch_statement::batch_statement(int bound_terms, type type_,
                                  std::vector<single_statement> statements,
                                  std::unique_ptr<attributes> attrs,
                                  cql_stats& stats)
-    : cql_statement_no_metadata(timeout_for_type(type_))
+    : cql_statement_opt_metadata(timeout_for_type(type_))
     , _bound_terms(bound_terms), _type(type_), _statements(std::move(statements))
     , _attrs(std::move(attrs))
     , _has_conditions(boost::algorithm::any_of(_statements, [] (auto&& s) { return s.statement->has_conditions(); }))
     , _stats(stats)
 {
+    if (has_conditions()) {
+        // A batch can be created not only by raw::batch_statement::prepare, but also by
+        // cql_server::connection::process_batch, which doesn't call any methods of
+        // cql3::statements::batch_statement, only constructs it. So let's call
+        // build_cas_result_set_metadata right from the constructor to avoid crash trying to access
+        // uninitialized batch metadata.
+        build_cas_result_set_metadata();
+    }
 }
 
 batch_statement::batch_statement(type type_,
@@ -179,12 +189,11 @@ future<std::vector<mutation>> batch_statement::get_mutations(service::storage_pr
     using mutation_set_type = std::unordered_set<mutation, mutation_hash_by_key, mutation_equals_by_key>;
     return do_with(mutation_set_type(), [this, &storage, &options, timeout, now, local, &query_state] (auto& result) mutable {
         result.reserve(_statements.size());
-        _stats.statements_in_batches += _statements.size();
         return do_for_each(boost::make_counting_iterator<size_t>(0),
                            boost::make_counting_iterator<size_t>(_statements.size()),
                            [this, &storage, &options, now, local, &result, timeout, &query_state] (size_t i) {
             auto&& statement = _statements[i].statement;
-            statement->inc_cql_stats();
+            ++_stats.statements[size_t(statement->type)];
             auto&& statement_options = options.for_statement(i);
             auto timestamp = _attrs->get_timestamp(now, statement_options);
             return statement->get_mutations(storage, statement_options, timeout, local, timestamp, query_state).then([&result] (auto&& more) {
@@ -255,7 +264,6 @@ static thread_local inheriting_concrete_execution_stage<
 
 future<shared_ptr<cql_transport::messages::result_message>> batch_statement::execute(
         service::storage_proxy& storage, service::query_state& state, const query_options& options) {
-    ++_stats.batches;
     return batch_stage(this, seastar::ref(storage), seastar::ref(state),
                        seastar::cref(options), false, options.get_timestamp(state));
 }
@@ -273,8 +281,13 @@ future<shared_ptr<cql_transport::messages::result_message>> batch_statement::do_
         throw new InvalidRequestException("Invalid empty serial consistency level");
 #endif
     if (_has_conditions) {
+        ++_stats.cas_batches;
+        _stats.statements_in_cas_batches += _statements.size();
         return execute_with_conditions(storage, options, query_state);
     }
+
+    ++_stats.batches;
+    _stats.statements_in_batches += _statements.size();
 
     auto timeout = db::timeout_clock::now() + options.get_timeout_config().*get_timeout_config_selector();
     return get_mutations(storage, options, timeout, local, now, query_state).then([this, &storage, &options, timeout, tr_state = query_state.get_trace_state(),
@@ -323,11 +336,80 @@ future<> batch_statement::execute_without_conditions(
 }
 
 future<shared_ptr<cql_transport::messages::result_message>> batch_statement::execute_with_conditions(
-        service::storage_proxy& storage,
+        service::storage_proxy& proxy,
         const query_options& options,
-        service::query_state& state)
-{
-    fail(unimplemented::cause::LWT);
+        service::query_state& qs) {
+
+    auto cl_for_commit = options.get_consistency();
+    auto cl_for_paxos = options.check_serial_consistency();
+    db::validate_for_cas(cl_for_paxos);
+    seastar::shared_ptr<cas_request> request;
+    schema_ptr schema;
+
+    db::timeout_clock::time_point now = db::timeout_clock::now();
+    const timeout_config& cfg = options.get_timeout_config();
+    auto batch_timeout = now + cfg.write_timeout; // Statement timeout.
+    auto cas_timeout = now + cfg.cas_timeout;     // Ballot contention timeout.
+    auto read_timeout = now + cfg.read_timeout;   // Query timeout.
+
+    for (size_t i = 0; i < _statements.size(); ++i) {
+
+        modification_statement& statement = *_statements[i].statement;
+        const query_options& statement_options = options.for_statement(i);
+
+        ++_stats.cas_statements[size_t(statement.type)];
+        modification_statement::json_cache_opt json_cache = statement.maybe_prepare_json_cache(statement_options);
+        // At most one key
+        std::vector<dht::partition_range> keys = statement.build_partition_keys(statement_options, json_cache);
+        if (keys.empty()) {
+            continue;
+        }
+        if (request.get() == nullptr) {
+            schema = statement.s;
+            request = seastar::make_shared<cas_request>(schema, std::move(keys));
+        } else if (keys.size() != 1 || keys.front().equal(request->key().front(), dht::ring_position_comparator(*schema)) == false) {
+            throw exceptions::invalid_request_exception("BATCH with conditions cannot span multiple partitions");
+        }
+        std::vector<query::clustering_range> ranges = statement.create_clustering_ranges(statement_options, json_cache);
+
+        request->add_row_update(statement, std::move(ranges), std::move(json_cache), statement_options);
+    }
+    if (request.get() == nullptr) {
+        throw exceptions::invalid_request_exception(format("Unrestricted partition key in a conditional BATCH"));
+    }
+
+    return proxy.cas(schema, request, request->read_command(), request->key(),
+            {read_timeout, qs.get_permit(), qs.get_client_state(), qs.get_trace_state()},
+            cl_for_paxos, cl_for_commit, batch_timeout, cas_timeout).then([this, request] (bool is_applied) {
+        return modification_statement::build_cas_result_set(_metadata, _columns_of_cas_result_set, is_applied, request->rows());
+    });
+}
+
+void batch_statement::build_cas_result_set_metadata() {
+    if (_statements.empty()) {
+        return;
+    }
+    const auto& schema = *_statements.front().statement->s;
+    // Add the mandatory [applied] column to result set metadata
+    std::vector<shared_ptr<column_specification>> columns;
+
+    auto applied = make_shared<cql3::column_specification>(schema.ks_name(), schema.cf_name(),
+            make_shared<cql3::column_identifier>("[applied]", false), boolean_type);
+    columns.push_back(applied);
+
+    for (const auto& def : boost::range::join(schema.partition_key_columns(), schema.clustering_key_columns())) {
+        _columns_of_cas_result_set.set(def.ordinal_id);
+    }
+    for (const auto& s : _statements) {
+        _columns_of_cas_result_set.union_with(s.statement->columns_of_cas_result_set());
+    }
+    columns.reserve(_columns_of_cas_result_set.count());
+    for (const auto& def : schema.all_columns()) {
+        if (_columns_of_cas_result_set.test(def.ordinal_id)) {
+            columns.emplace_back(def.column_specification);
+        }
+    }
+    _metadata = seastar::make_shared<cql3::metadata>(std::move(columns));
 }
 
 namespace raw {

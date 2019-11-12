@@ -420,7 +420,7 @@ flat_mutation_reader_from_mutations(std::vector<mutation> mutations, const dht::
                 if (!_static_row_done) {
                     _static_row_done = true;
                     if (!_cur->partition().static_row().empty()) {
-                        push_mutation_fragment(static_row(std::move(_cur->partition().static_row())));
+                        push_mutation_fragment(static_row(std::move(_cur->partition().static_row().get_existing())));
                     }
                 }
                 auto mfopt = read_next();
@@ -922,8 +922,13 @@ void flat_mutation_reader::do_upgrade_schema(const schema_ptr& s) {
 }
 
 bool mutation_fragment_stream_validator::operator()(const dht::decorated_key& dk) {
-    // FIXME: Validate partition key monotonicity
-    //        https://github.com/scylladb/scylla/issues/4804
+    if (_compare_keys) {
+        if (_prev_partition_key.less_compare(_schema, dk)) {
+            _prev_partition_key = dk;
+        } else {
+            on_internal_error(fmr_logger, format("[validator {}] Unexpected partition key: previous {}, current {}", _prev_partition_key, dk));
+        }
+    }
     return true;
 }
 
@@ -933,14 +938,9 @@ mutation_fragment_stream_validator::mutation_fragment_stream_validator(const sch
     , _prev_pos(position_in_partition::end_of_partition_tag_t{})
     , _prev_region(partition_region::partition_end)
     , _compare_keys(compare_keys)
+    , _prev_partition_key(dht::minimum_token(), partition_key::make_empty())
 {
     fmr_logger.debug("[validator {}] Will validate {} monotonicity.", static_cast<void*>(this), compare_keys ? "keys" : "only partition regions");
-}
-
-mutation_fragment_stream_validator::~mutation_fragment_stream_validator() {
-    if (_prev_kind != mutation_fragment::kind::partition_end) {
-        on_internal_error(fmr_logger, format("[validator {}] Stream ended with unclosed partition: {}", static_cast<void*>(this), _prev_kind));
-    }
 }
 
 bool mutation_fragment_stream_validator::operator()(const mutation_fragment& mv) {
@@ -981,4 +981,10 @@ bool mutation_fragment_stream_validator::operator()(const mutation_fragment& mv)
         _prev_region = region;
     }
     return true;
+}
+
+void mutation_fragment_stream_validator::on_end_of_stream() const {
+    if (_prev_kind != mutation_fragment::kind::partition_end) {
+        on_internal_error(fmr_logger, format("[validator {}] Stream ended with unclosed partition: {}", static_cast<const void*>(this), _prev_kind));
+    }
 }

@@ -23,17 +23,19 @@
 
 #pragma once
 
+#include "cql3/statements/statement_type.hh"
+
 namespace cql3 {
 
 // Shard-local CQL statistics
 // @sa cql3/query_processor.cc explains the meaning of each counter
 struct cql_stats {
-    uint64_t reads = 0;
-    uint64_t inserts = 0;
-    uint64_t updates = 0;
-    uint64_t deletes = 0;
+    uint64_t statements[statements::statement_type::MAX_VALUE + 1] = {};
+    uint64_t cas_statements[statements::statement_type::MAX_VALUE + 1] = {};
     uint64_t batches = 0;
+    uint64_t cas_batches = 0;
     uint64_t statements_in_batches = 0;
+    uint64_t statements_in_cas_batches = 0;
     uint64_t batches_pure_logged = 0;
     uint64_t batches_pure_unlogged = 0;
     uint64_t batches_unlogged_from_logged = 0;

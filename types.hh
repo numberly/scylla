@@ -540,7 +540,11 @@ public:
      */
     bool is_value_compatible_with(const abstract_type& other) const;
     bool references_user_type(const sstring& keyspace, const bytes& name) const;
+
+    // For types that contain (or are equal to) the given user type (e.g., a set of elements of this type),
+    // updates them with the new version of the type ('updated'). For other types does nothing.
     std::optional<data_type> update_user_type(const shared_ptr<const user_type_impl> updated) const;
+
     bool references_duration() const;
     std::optional<uint32_t> value_length_if_fixed() const {
         return _value_length_if_fixed;
@@ -962,6 +966,12 @@ shared_ptr<const abstract_type> data_type_for<db_clock::time_point>() {
 
 template <>
 inline
+shared_ptr<const abstract_type> data_type_for<ascii_native_type>() {
+    return ascii_type;
+}
+
+template <>
+inline
 shared_ptr<const abstract_type> data_type_for<time_native_type>() {
     return time_type;
 }
@@ -1050,6 +1060,8 @@ to_bytes_opt(bytes_view_opt bv) {
     }
     return std::nullopt;
 }
+
+std::vector<bytes_opt> to_bytes_opt_vec(const std::vector<bytes_view_opt>&);
 
 inline
 bytes_view_opt

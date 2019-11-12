@@ -81,13 +81,19 @@ class std_optional:
         self.ref = ref
 
     def get(self):
-        return self.ref['_M_payload']['_M_payload']['_M_value']
+        try:
+            return self.ref['_M_payload']['_M_payload']['_M_value']
+        except gdb.error:
+            return self.ref['_M_payload'] # Scylla 3.0 compatibility
 
     def __bool__(self):
         return self.__nonzero__()
 
     def __nonzero__(self):
-        return bool(self.ref['_M_payload']['_M_engaged'])
+        try:
+            return bool(self.ref['_M_payload']['_M_engaged'])
+        except gdb.error:
+            return bool(self.ref['_M_engaged']) # Scylla 3.0 compatibility
 
 
 class intrusive_set:
@@ -272,7 +278,10 @@ class static_vector:
     def __iter__(self):
         t = self.ref.type.strip_typedefs()
         value_type = t.template_argument(0)
-        data = self.ref['m_holder']['storage']['dummy']['dummy'].cast(value_type.pointer())
+        try:
+            data = self.ref['m_holder']['storage']['dummy']['dummy'].cast(value_type.pointer())
+        except gdb.error:
+            data = self.ref['m_holder']['storage']['dummy'].cast(value_type.pointer()) # Scylla 3.0 compatibility
         for i in range(self.__len__()):
             yield data[i]
 
@@ -560,6 +569,103 @@ def get_text_range():
             return text_start, text_end
 
     raise Exception("Failed to find text start and end")
+
+
+class histogram:
+    """Simple histogram.
+
+    Aggregate items by their count and present them in a histogram format.
+    Example:
+
+        h = histogram()
+        h['item1'] = 20 # Set an absolute value
+        h.add('item2') # Equivalent to h['item2'] += 1
+        h.add('item2')
+        h.add('item3')
+        h.print()
+
+    Would print:
+        4 item1 ++++++++++++++++++++++++++++++++++++++++
+        2 item2 ++++
+        1 item1 ++
+
+    Note that the number of indicators ('+') is does not correspond to the
+    actual number of items, rather it is supposed to illustrate their relative
+    counts.
+    """
+    _column_count = 40
+
+    def __init__(self, counts = defaultdict(int), print_indicators = True, formatter=None):
+        """Constructor.
+
+        Params:
+        * counts: initial counts (default to empty).
+        * print_indicators: print the '+' characters to illustrate relative
+            count. Can be turned off when the item names are very long and would
+            thus make indicators unreadable.
+        * formatter: a callable that receives the item as its argument and is
+            expected to return the string to be printed in the second column.
+            By default, items are printed verbatim.
+        """
+        self._counts = counts
+        self._print_indicators = print_indicators
+
+        def default_formatter(value):
+            return str(value)
+        if formatter is None:
+            self._formatter = default_formatter
+        else:
+            self._formatter = formatter
+
+    def __len__(self):
+        return len(self._counts)
+
+    def __nonzero__(self):
+        return bool(len(self))
+
+    def __getitem__(self, item):
+        return self._counts[item]
+
+    def __setitem__(self, item, value):
+        self._counts[item] = value
+
+    def add(self, item):
+        self._counts[item] += 1
+
+    def __str__(self):
+        if not self._counts:
+            return ''
+
+        by_counts = defaultdict(list)
+        for k, v in self._counts.items():
+            by_counts[v].append(k)
+
+        counts_sorted = list(reversed(sorted(by_counts.keys())))
+        max_count = counts_sorted[0]
+
+        if max_count == 0:
+            count_per_column = 0
+        else:
+            count_per_column = self._column_count / max_count
+
+        lines = []
+
+        for count in counts_sorted:
+            items = by_counts[count]
+            if self._print_indicators:
+                indicator = '+' * max(1, int(count * count_per_column))
+            else:
+                indicator = ''
+            for item in items:
+                lines.append('{:9d} {} {}'.format(count, self._formatter(item), indicator))
+
+        return '\n'.join(lines)
+
+    def __repr__(self):
+        return 'histogram({})'.format(self._counts)
+
+    def print(self):
+        gdb.write(str(self) + '\n')
 
 
 class scylla(gdb.Command):
@@ -978,8 +1084,105 @@ class span_checker(object):
 
 
 class scylla_memory(gdb.Command):
+    """Summarize the state of the shard's memory.
+
+    The goal of this summary is to provide a starting point when investigating
+    memory issues.
+
+    The summary consists of two parts:
+    * A high level overview.
+    * A per size-class population statistics.
+
+    In an OOM situation the latter usually shows the immediate symptoms, one
+    or more heavily populated size classes eating up all memory. The overview
+    can be used to identify the subsystem that owns these problematic objects.
+    """
+
     def __init__(self):
         gdb.Command.__init__(self, 'scylla memory', gdb.COMMAND_USER, gdb.COMPLETE_COMMAND)
+
+    @staticmethod
+    def summarize_inheriting_execution_stage(ies):
+        scheduling_group_names = {int(tq['_id']): str(tq['_name']) for tq in get_local_task_queues()}
+        per_sg_stages = []
+        i = 0
+        for es_opt in std_vector(ies['_stage_for_group']):
+            es_opt = std_optional(es_opt)
+            if not es_opt:
+                continue
+            es = es_opt.get()
+            enqueued = int(es['_stats']['function_calls_enqueued'])
+            executed = int(es['_stats']['function_calls_executed'])
+            size = enqueued - executed
+            if size > 0:
+                per_sg_stages.append((i, scheduling_group_names[i], size))
+            i += 1
+
+        return per_sg_stages
+
+    @staticmethod
+    def summarize_table_phased_barrier_users(db, barrier_name):
+        tables_by_count = defaultdict(list)
+        for table in for_each_table():
+            schema = schema_ptr(table['_schema'])
+            g = seastar_lw_shared_ptr(table[barrier_name]['_gate']).get()
+            count = int(g['_count'])
+            if count > 0:
+                tables_by_count[count].append(str(schema.table_name()).replace('"', ''))
+
+        return [(c, tables_by_count[c]) for c in reversed(sorted(tables_by_count.keys()))]
+
+    @staticmethod
+    def print_replica_stats():
+        db = sharded(gdb.parse_and_eval('::debug::db')).local()
+
+        gdb.write('Replica:\n')
+        gdb.write('  Read Concurrency Semaphores:\n'
+                '    user sstable reads:      {user_sst_rd_count:>3}/{user_sst_rd_max_count:>3}, remaining mem: {user_sst_rd_mem:>13} B, queued: {user_sst_rd_queued}\n'
+                '    streaming sstable reads: {streaming_sst_rd_count:>3}/{streaming_sst_rd_max_count:>3}, remaining mem: {system_sst_rd_mem:>13} B, queued: {streaming_sst_rd_queued}\n'
+                '    system sstable reads:    {system_sst_rd_count:>3}/{system_sst_rd_max_count:>3}, remaining mem: {system_sst_rd_mem:>13} B, queued: {system_sst_rd_queued}\n'
+                .format(
+                        user_sst_rd_count=int(gdb.parse_and_eval('database::max_count_concurrent_reads')) - int(db['_read_concurrency_sem']['_resources']['count']),
+                        user_sst_rd_max_count=int(gdb.parse_and_eval('database::max_count_concurrent_reads')),
+                        user_sst_rd_mem=int(db['_read_concurrency_sem']['_resources']['memory']),
+                        user_sst_rd_queued=int(db['_read_concurrency_sem']['_wait_list']['_size']),
+                        streaming_sst_rd_count=int(gdb.parse_and_eval('database::max_count_streaming_concurrent_reads')) - int(db['_streaming_concurrency_sem']['_resources']['count']),
+                        streaming_sst_rd_max_count=int(gdb.parse_and_eval('database::max_count_streaming_concurrent_reads')),
+                        streaming_sst_rd_mem=int(db['_streaming_concurrency_sem']['_resources']['memory']),
+                        streaming_sst_rd_queued=int(db['_streaming_concurrency_sem']['_wait_list']['_size']),
+                        system_sst_rd_count=int(gdb.parse_and_eval('database::max_count_system_concurrent_reads')) - int(db['_system_read_concurrency_sem']['_resources']['count']),
+                        system_sst_rd_max_count=int(gdb.parse_and_eval('database::max_count_system_concurrent_reads')),
+                        system_sst_rd_mem=int(db['_system_read_concurrency_sem']['_resources']['memory']),
+                        system_sst_rd_queued=int(db['_system_read_concurrency_sem']['_wait_list']['_size'])))
+
+        gdb.write('  Execution Stages:\n')
+        for es_path in [('_data_query_stage',), ('_mutation_query_stage', '_execution_stage'), ('_apply_stage',)]:
+            machine_name = es_path[0]
+            human_name = machine_name.replace('_', ' ').strip()
+            total = 0
+
+            gdb.write('    {}:\n'.format(human_name))
+            es = db
+            for path_component in es_path:
+                es = es[path_component]
+            for sg_id, sg_name, count in scylla_memory.summarize_inheriting_execution_stage(es):
+                total += count
+                gdb.write('      {:02} {:32} {}\n'.format(sg_id, sg_name, count))
+            gdb.write('         {:32} {}\n'.format('Total', total))
+
+        gdb.write('  Tables - Ongoing Operations:\n')
+        for machine_name in ['_pending_writes_phaser', '_pending_reads_phaser', '_pending_streams_phaser']:
+            human_name = machine_name.replace('_', ' ').strip()
+            gdb.write('    {} (top 10):\n'.format(human_name))
+            total = 0
+            i = 0
+            for count, tables in scylla_memory.summarize_table_phased_barrier_users(db, machine_name):
+                total += count
+                if i < 10:
+                    gdb.write('      {:9} {}\n'.format(count, ', '.join(tables)))
+                i += 1
+            gdb.write('      {:9} Total (all)\n'.format(total))
+        gdb.write('\n')
 
     def invoke(self, arg, from_tty):
         cpu_mem = gdb.parse_and_eval('\'seastar::memory::cpu_mem\'')
@@ -1048,6 +1251,8 @@ class scylla_memory(gdb.Command):
                   bg_rd=int(sp['_stats']['reads']) - int(sp['_stats']['foreground_reads']),
                   regular=int(hm['_stats']['size_of_hints_in_progress']),
                   views=int(view_hm['_stats']['size_of_hints_in_progress'])))
+
+        scylla_memory.print_replica_stats()
 
         gdb.write('Small pools:\n')
         small_pools = cpu_mem['small_pools']
@@ -1469,7 +1674,10 @@ class scylla_ptr(gdb.Command):
             ptr_meta.offset_in_object = ptr - span.start
 
         # FIXME: handle debug-mode build
-        index = gdb.parse_and_eval('(%d - \'logalloc::shard_segment_pool\'._store._segments_base) / \'logalloc::segment\'::size' % (ptr))
+        try:
+            index = gdb.parse_and_eval('(%d - \'logalloc::shard_segment_pool\'._store._segments_base) / \'logalloc::segment\'::size' % (ptr))
+        except gdb.error:
+            index = gdb.parse_and_eval('(%d - \'logalloc::shard_segment_pool\'._segments_base) / \'logalloc::segment\'::size' % (ptr)) # Scylla 3.0 compatibility
         desc = gdb.parse_and_eval('\'logalloc::shard_segment_pool\'._segments._M_impl._M_start[%d]' % (index))
         ptr_meta.is_lsa = bool(desc['_region'])
 
@@ -1488,7 +1696,10 @@ class scylla_segment_descs(gdb.Command):
 
     def invoke(self, arg, from_tty):
         # FIXME: handle debug-mode build
-        base = int(gdb.parse_and_eval('\'logalloc\'::shard_segment_pool._store._segments_base'))
+        try:
+            base = int(gdb.parse_and_eval('\'logalloc\'::shard_segment_pool._store._segments_base'))
+        except gdb.error:
+            base = int(gdb.parse_and_eval('\'logalloc\'::shard_segment_pool._segments_base'))
         segment_size = int(gdb.parse_and_eval('\'logalloc\'::segment::size'))
         addr = base
         for desc in std_vector(gdb.parse_and_eval('\'logalloc\'::shard_segment_pool._segments')):
@@ -2612,7 +2823,7 @@ class scylla_generate_object_graph(gdb.Command):
                             stop = True
                             break
 
-                    edges[(next_obj, address)].add(next_off)
+                    edges[(next_obj, current_obj)].add(next_off)
                     if next_obj in vertices:
                         continue
 
@@ -2710,6 +2921,92 @@ class scylla_generate_object_graph(gdb.Command):
 
         if extension != 'dot':
             subprocess.check_call(['dot', '-T' + extension, dot_file, '-o', args.output_file])
+
+
+class scylla_smp_queues(gdb.Command):
+    """Summarize the shard's outgoing smp queues.
+
+    The summary takes the form of a histogram. Example:
+
+	(gdb) scylla smp-queues
+	    10747 17 ->  3 ++++++++++++++++++++++++++++++++++++++++
+	      721 17 -> 19 ++
+	      247 17 -> 20 +
+	      233 17 -> 10 +
+	      210 17 -> 14 +
+	      205 17 ->  4 +
+	      204 17 ->  5 +
+	      198 17 -> 16 +
+	      197 17 ->  6 +
+	      189 17 -> 11 +
+	      181 17 ->  1 +
+	      179 17 -> 13 +
+	      176 17 ->  2 +
+	      173 17 ->  0 +
+	      163 17 ->  8 +
+		1 17 ->  9 +
+
+    Each line has the following format
+
+        count from -> to ++++
+
+    Where:
+        count: the number of items in the queue;
+        from: the shard, from which the message was sent (this shard);
+        to: the shard, to which the message is sent;
+        ++++: visual illustration of the relative size of this queue;
+    """
+    def __init__(self):
+        gdb.Command.__init__(self, 'scylla smp-queues', gdb.COMMAND_USER, gdb.COMPLETE_COMMAND)
+        qs = std_unique_ptr(gdb.parse_and_eval('seastar::smp::_qs')).get()
+        self.queues = set()
+        for i in range(cpus()):
+            for j in range(cpus()):
+                self.queues.add(int(qs[i][j].address))
+        self._queue_type = gdb.lookup_type('seastar::smp_message_queue').pointer()
+        self._ptr_type = gdb.lookup_type('uintptr_t').pointer()
+
+    def invoke(self, arg, from_tty):
+        def formatter(q):
+            a, b = q
+            return '{:2} -> {:2}'.format(a, b)
+
+        h = histogram(formatter=formatter)
+        known_vptrs = dict()
+
+        for obj, vptr in find_vptrs():
+            obj = int(obj)
+            vptr = int(vptr)
+
+            if not vptr in known_vptrs:
+                name = resolve(vptr, cache=False)
+                if name is None or not name.startswith('vtable for seastar::smp_message_queue::async_work_item'):
+                    continue
+
+                known_vptrs[vptr] = None
+
+            offset = known_vptrs[vptr]
+
+            if offset is None:
+                q = None
+                ptr_meta = scylla_ptr.analyze(obj)
+                for offset in range(0, ptr_meta.size, self._ptr_type.sizeof):
+                    ptr = int(gdb.Value(obj + offset).reinterpret_cast(self._ptr_type).dereference())
+                    if ptr in self.queues:
+                        q = gdb.Value(ptr).reinterpret_cast(self._queue_type).dereference()
+                        break
+                known_vptrs[vptr] = offset
+                if q is None:
+                    continue
+            else:
+                ptr = int(gdb.Value(obj + offset).reinterpret_cast(self._ptr_type).dereference())
+                q = gdb.Value(ptr).reinterpret_cast(self._queue_type).dereference()
+
+            a = int(q['_completed']['remote']['_id'])
+            b = int(q['_pending']['remote']['_id'])
+            h[(a, b)] += 1
+
+        gdb.write('{}\n'.format(h))
 
 
 class scylla_gdb_func_dereference_lw_shared_ptr(gdb.Function):
@@ -2820,6 +3117,7 @@ scylla_cache()
 scylla_sstables()
 scylla_memtables()
 scylla_generate_object_graph()
+scylla_smp_queues()
 
 
 # Convenience functions

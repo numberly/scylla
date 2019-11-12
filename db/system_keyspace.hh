@@ -54,6 +54,7 @@
 #include "mutation_query.hh"
 #include <map>
 #include <seastar/core/distributed.hh>
+#include "service/paxos/paxos_state.hh"
 
 namespace service {
 
@@ -162,8 +163,16 @@ future<> setup(distributed<database>& db,
                distributed<cql3::query_processor>& qp,
                distributed<service::storage_service>& ss);
 future<> update_schema_version(utils::UUID version);
-future<> update_tokens(std::unordered_set<dht::token> tokens);
-future<> update_tokens(gms::inet_address ep, std::unordered_set<dht::token> tokens);
+
+/*
+ * Save tokens used by this node in the LOCAL table.
+ */
+future<> update_tokens(const std::unordered_set<dht::token>& tokens);
+
+/**
+ * Record tokens being used by another node in the PEERS table.
+ */
+future<> update_tokens(gms::inet_address ep, const std::unordered_set<dht::token>& tokens);
 
 future<> update_preferred_ip(gms::inet_address ep, gms::inet_address preferred_ip);
 future<std::unordered_map<gms::inet_address, gms::inet_address>> get_preferred_ips();
@@ -478,17 +487,6 @@ enum class bootstrap_state {
 #endif
 
     /**
-     * Convenience method to update the list of tokens in the local system keyspace.
-     *
-     * @param addTokens tokens to add
-     * @param rmTokens tokens to remove
-     * @return the collection of persisted tokens
-     */
-    future<std::unordered_set<dht::token>> update_local_tokens(
-        const std::unordered_set<dht::token> add_tokens,
-        const std::unordered_set<dht::token> rm_tokens);
-
-    /**
      * Return a map of stored tokens to IP addresses
      *
      */
@@ -500,6 +498,10 @@ enum class bootstrap_state {
      */
     future<std::unordered_map<gms::inet_address, utils::UUID>> load_host_ids();
 
+    /*
+     * Read this node's tokens stored in the LOCAL table.
+     * Used to initialize a restarting node.
+     */
     future<std::unordered_set<dht::token>> get_saved_tokens();
 
     future<std::unordered_map<gms::inet_address, sstring>> load_peer_features();
@@ -611,6 +613,13 @@ future<> mark_view_as_built(sstring ks_name, sstring view_name);
 future<> remove_built_view(sstring ks_name, sstring view_name);
 future<std::vector<view_name>> load_built_views();
 future<std::vector<view_build_progress>> load_view_build_progress();
+
+// Paxos related functions
+future<service::paxos::paxos_state> load_paxos_state(partition_key key, schema_ptr s, gc_clock::time_point now,
+        db::timeout_clock::time_point timeout);
+future<> save_paxos_promise(const schema& s, const partition_key& key, const utils::UUID& ballot, db::timeout_clock::time_point timeout);
+future<> save_paxos_proposal(const schema& s, const service::paxos::proposal& proposal, db::timeout_clock::time_point timeout);
+future<> save_paxos_decision(const schema& s, const service::paxos::proposal& decision, db::timeout_clock::time_point timeout);
 
 } // namespace system_keyspace
 } // namespace db

@@ -60,6 +60,7 @@
 #include "mutation_query.hh"
 #include "system_keyspace.hh"
 #include "cql3/cql3_type.hh"
+#include "cdc/cdc.hh"
 
 #include "db/marshal/type_parser.hh"
 #include "db/config.hh"
@@ -300,6 +301,7 @@ schema_ptr scylla_tables() {
             .with_column("keyspace_name", utf8_type, column_kind::partition_key)
             .with_column("table_name", utf8_type, column_kind::clustering_key)
             .with_column("version", uuid_type)
+            .with_column("cdc", map_type_impl::get_instance(utf8_type, utf8_type, false))
             .set_gc_grace_seconds(schema_gc_grace)
             .with_version(generate_schema_version(id))
             .build();
@@ -1345,15 +1347,14 @@ make_map_mutation(const Map& map,
     auto vtyp = column_type->get_values_type();
 
     if (column_type->is_multi_cell()) {
-        map_type_impl::mutation mut;
+        collection_mutation_description mut;
 
         for (auto&& entry : map) {
             auto te = f(entry);
             mut.cells.emplace_back(ktyp->decompose(data_value(te.first)), atomic_cell::make_live(*vtyp, timestamp, vtyp->decompose(data_value(te.second)), atomic_cell::collection_member::yes));
         }
 
-        auto col_mut = column_type->serialize_mutation_form(std::move(mut));
-        return atomic_cell_or_collection::from_collection_mutation(std::move(col_mut));
+        return mut.serialize(*column_type);
     } else {
         map_type_impl::native_type tmp;
         tmp.reserve(map.size());
@@ -1458,18 +1459,6 @@ lw_shared_ptr<keyspace_metadata> create_keyspace_from_schema_partition(const sch
     return make_lw_shared<keyspace_metadata>(keyspace_name, strategy_name, strategy_options, durable_writes);
 }
 
-template<typename K, typename V>
-static std::optional<std::map<K, V>> get_map(const query::result_set_row& row, const sstring& name) {
-    if (auto values = row.get<map_type_impl::native_type>(name)) {
-        std::map<K, V> map;
-        for (auto&& entry : *values) {
-            map.emplace(value_cast<K>(entry.first), value_cast<V>(entry.second));
-        };
-        return map;
-    }
-    return std::nullopt;
-}
-
 template<typename V>
 static std::vector<V> get_list(const query::result_set_row& row, const sstring& name) {
     std::vector<V> list;
@@ -1502,7 +1491,7 @@ make_list_mutation(const std::vector<T, Args...>& values,
     auto vtyp = column_type->get_elements_type();
 
     if (column_type->is_multi_cell()) {
-        list_type_impl::mutation m;
+        collection_mutation_description m;
         m.cells.reserve(values.size());
         m.tomb.timestamp = timestamp - 1;
         m.tomb.deletion_time = gc_clock::now();
@@ -1515,8 +1504,7 @@ make_list_mutation(const std::vector<T, Args...>& values,
                 atomic_cell::make_live(*vtyp, timestamp, vtyp->decompose(std::move(dv)), atomic_cell::collection_member::yes));
         }
 
-        auto list_mut = column_type->serialize_mutation_form(std::move(m));
-        return atomic_cell_or_collection::from_collection_mutation(std::move(list_mut));
+        return m.serialize(*column_type);
     } else {
         list_type_impl::native_type tmp;
         tmp.reserve(values.size());
@@ -1685,6 +1673,7 @@ mutation make_scylla_tables_mutation(schema_ptr table, api::timestamp_type times
     auto ckey = clustering_key::from_singular(*s, table->cf_name());
     mutation m(scylla_tables(), pkey);
     m.set_clustered_cell(ckey, "version", utils::UUID(table->version()), timestamp);
+    store_map(m, ckey, "cdc", timestamp, table->cdc_options().to_map());
     return m;
 }
 
@@ -2207,6 +2196,11 @@ schema_ptr create_table_from_mutations(const schema_ctxt& ctxt, schema_mutations
     } else {
         builder.with_version(sm.digest());
     }
+    if (auto map = sm.cdc_options()) {
+        cdc::options cdc_options(*map);
+        builder.set_cdc_options(std::move(cdc_options));
+    }
+
     return builder.build();
 }
 

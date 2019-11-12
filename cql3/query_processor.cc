@@ -114,38 +114,77 @@ query_processor::query_processor(service::storage_proxy& proxy, database& db, qu
     }
     _metrics.add_group("query_processor", qp_group);
 
+    sm::label cas_label("conditional");
+    auto cas_label_instance = cas_label("yes");
+    auto non_cas_label_instance = cas_label("no");
+
     _metrics.add_group(
             "cql",
             {
                     sm::make_derive(
                             "reads",
-                            _cql_stats.reads,
+                            _cql_stats.statements[size_t(statement_type::SELECT)],
                             sm::description("Counts a total number of CQL read requests.")),
 
                     sm::make_derive(
                             "inserts",
-                            _cql_stats.inserts,
-                            sm::description("Counts a total number of CQL INSERT requests.")),
+                            _cql_stats.statements[size_t(statement_type::INSERT)],
+                            sm::description("Counts a total number of CQL INSERT requests without conditions."),
+                            {non_cas_label_instance}),
+
+                    sm::make_derive(
+                            "inserts",
+                            _cql_stats.cas_statements[size_t(statement_type::INSERT)],
+                            sm::description("Counts a total number of CQL INSERT requests with conditions."),
+                            {cas_label_instance}),
 
                     sm::make_derive(
                             "updates",
-                            _cql_stats.updates,
-                            sm::description("Counts a total number of CQL UPDATE requests.")),
+                            _cql_stats.statements[size_t(statement_type::UPDATE)],
+                            sm::description("Counts a total number of CQL UPDATE requests without conditions."),
+                            {non_cas_label_instance}),
+
+                    sm::make_derive(
+                            "updates",
+                            _cql_stats.cas_statements[size_t(statement_type::UPDATE)],
+                            sm::description("Counts a total number of CQL UPDATE requests with conditions."),
+                            {cas_label_instance}),
 
                     sm::make_derive(
                             "deletes",
-                            _cql_stats.deletes,
-                            sm::description("Counts a total number of CQL DELETE requests.")),
+                            _cql_stats.statements[size_t(statement_type::DELETE)],
+                            sm::description("Counts a total number of CQL DELETE requests without conditions."),
+                            {non_cas_label_instance}),
+
+                    sm::make_derive(
+                            "deletes",
+                            _cql_stats.cas_statements[size_t(statement_type::DELETE)],
+                            sm::description("Counts a total number of CQL DELETE requests with conditions."),
+                            {cas_label_instance}),
 
                     sm::make_derive(
                             "batches",
                             _cql_stats.batches,
-                            sm::description("Counts a total number of CQL BATCH requests.")),
+                            sm::description("Counts a total number of CQL BATCH requests without conditions."),
+                            {non_cas_label_instance}),
+
+                    sm::make_derive(
+                            "batches",
+                            _cql_stats.cas_batches,
+                            sm::description("Counts a total number of CQL BATCH requests with conditions."),
+                            {cas_label_instance}),
 
                     sm::make_derive(
                             "statements_in_batches",
                             _cql_stats.statements_in_batches,
-                            sm::description("Counts a total number of sub-statements in CQL BATCH requests.")),
+                            sm::description("Counts a total number of sub-statements in CQL BATCH requests without conditions."),
+                            {non_cas_label_instance}),
+
+                    sm::make_derive(
+                            "statements_in_batches",
+                            _cql_stats.statements_in_cas_batches,
+                            sm::description("Counts a total number of sub-statements in CQL BATCH requests with conditions."),
+                            {cas_label_instance}),
 
                     sm::make_derive(
                             "batches_pure_logged",

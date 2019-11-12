@@ -216,6 +216,12 @@ public:
         return make_ready_future<>();
     }
 
+    virtual future<> require_table_does_not_exist(const sstring& ks_name, const sstring& table_name) override {
+        auto& db = _db->local();
+        assert(!db.has_schema(ks_name, table_name));
+        return make_ready_future<>();
+    }
+
     virtual future<> require_column_has_value(const sstring& table_name,
                                       std::vector<data_value> pk,
                                       std::vector<data_value> ck,
@@ -254,9 +260,8 @@ public:
                 assert(c.is_live());
                 actual = c.value().linearize();
             } else {
-                auto c = cell->as_collection_mutation();
-                auto type = dynamic_pointer_cast<const collection_type_impl>(col_def->type);
-                actual = type->to_value(c, cql_serialization_format::internal());
+                actual = serialize_for_cql(*col_def->type,
+                        cell->as_collection_mutation(), cql_serialization_format::internal());
             }
             assert(col_def->type->equal(actual, exp));
           });

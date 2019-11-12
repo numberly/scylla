@@ -39,6 +39,7 @@
  * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "cdc/cdc.hh"
 #include "cql3/statements/modification_statement.hh"
 #include "cql3/statements/raw/modification_statement.hh"
 #include "cql3/statements/prepared_statement.hh"
@@ -49,15 +50,18 @@
 #include <boost/range/adaptor/transformed.hpp>
 #include <boost/range/adaptor/map.hpp>
 #include <boost/range/adaptor/indirected.hpp>
+#include "db/config.hh"
+#include "dht/murmur3_partitioner.hh"
 #include "service/storage_service.hh"
 #include "database.hh"
 #include <seastar/core/execution_stage.hh>
+#include "utils/UUID_gen.hh"
+#include "partition_slice_builder.hh"
+#include "cas_request.hh"
 
 namespace cql3 {
 
 namespace statements {
-
-thread_local const ::shared_ptr<column_identifier> modification_statement::CAS_RESULT_COLUMN = ::make_shared<column_identifier>("[applied]", false);
 
 timeout_config_selector
 modification_statement_timeout(const schema& s) {
@@ -68,14 +72,14 @@ modification_statement_timeout(const schema& s) {
     }
 }
 
-modification_statement::modification_statement(statement_type type_, uint32_t bound_terms, schema_ptr schema_, std::unique_ptr<attributes> attrs_, uint64_t* cql_stats_counter_ptr)
-    : cql_statement_no_metadata(modification_statement_timeout(*schema_))
+modification_statement::modification_statement(statement_type type_, uint32_t bound_terms, schema_ptr schema_, std::unique_ptr<attributes> attrs_, cql_stats& stats)
+    : cql_statement_opt_metadata(modification_statement_timeout(*schema_))
     , type{type_}
     , _bound_terms{bound_terms}
     , s{schema_}
     , attrs{std::move(attrs_)}
     , _column_operations{}
-    , _cql_modification_counter_ptr(cql_stats_counter_ptr)
+    , _stats(stats)
 { }
 
 bool modification_statement::uses_function(const sstring& ks_name, const sstring& function_name) const {
@@ -189,6 +193,41 @@ modification_statement::get_mutations(service::storage_proxy& proxy, const query
     });
 }
 
+bool modification_statement::applies_to(const update_parameters::prefetch_data::row* row,
+        const query_options& options) const {
+
+    // Assume the row doesn't exist if it has no static columns and the statement is only interested
+    // in static column values. Needed for EXISTS checks to work correctly. For example, the following
+    // conditional INSERT must apply, because there's no static row in the partition although there's
+    // a regular row, which is fetched by the read:
+    //   CREATE TABLE t(p int, c int, s int static, PRIMARY KEY(p, c));
+    //   INSERT INTO t(p, c) VALUES(1, 1);
+    //   INSERT INTO t(p, s) VALUES(1, 1) IF NOT EXISTS;
+    if (has_only_static_column_conditions() && row && !row->has_static_columns(s)) {
+        row = nullptr;
+    }
+
+    if (_if_exists) {
+        return row != nullptr;
+    }
+    if (_if_not_exists) {
+        return row == nullptr;
+    }
+
+    auto condition_applies = [&row, &options](const shared_ptr<column_condition>& cond) {
+        const data_value* value = nullptr;
+        if (row != nullptr) {
+            auto it = row->cells.find(cond->column.ordinal_id);
+            if (it != row->cells.end()) {
+                value = &it->second;
+            }
+        }
+        return cond->applies_to(value, options);
+    };
+    return (std::all_of(_static_conditions.begin(), _static_conditions.end(), condition_applies) &&
+            std::all_of(_column_conditions.begin(), _column_conditions.end(), condition_applies));
+}
+
 std::vector<mutation> modification_statement::apply_updates(
         const std::vector<dht::partition_range>& keys,
         const std::vector<query::clustering_range>& ranges,
@@ -221,36 +260,6 @@ modification_statement::read_command(query::clustering_row_ranges ranges, db::co
 
 std::vector<query::clustering_range>
 modification_statement::create_clustering_ranges(const query_options& options, const json_cache_opt& json_cache) {
-    // If the only updated/deleted columns are static, then we don't need clustering columns.
-    // And in fact, unless it is an INSERT, we reject if clustering columns are provided as that
-    // suggest something unintended. For instance, given:
-    //   CREATE TABLE t (k int, v int, s int static, PRIMARY KEY (k, v))
-    // it can make sense to do:
-    //   INSERT INTO t(k, v, s) VALUES (0, 1, 2)
-    // but both
-    //   UPDATE t SET s = 3 WHERE k = 0 AND v = 1
-    //   DELETE v FROM t WHERE k = 0 AND v = 1
-    // sounds like you don't really understand what your are doing.
-    if (applies_only_to_static_columns()) {
-        // If we set no non-static columns, then it's fine not to have clustering columns
-        if (!_restrictions->has_clustering_columns_restriction()) {
-            return { query::clustering_range::make_open_ended_both_sides() };
-        }
-
-        // If we do have clustering columns however, then either it's an INSERT and the query is valid
-        // but we still need to build a proper prefix, or it's not an INSERT, and then we want to reject
-        // (see above)
-        if (!type.is_insert()) {
-            if (_restrictions->has_clustering_columns_restriction()) {
-                throw exceptions::invalid_request_exception(format("Invalid restriction on clustering column {} since the {} statement modifies only static columns",
-                    _restrictions->get_clustering_columns_restrictions()->get_column_defs().front()->name_as_text(), type));
-            }
-
-            // we should get there as it contradicts !_restrictions->has_clustering_columns_restriction()
-            throw std::logic_error("contradicts !_restrictions->has_clustering_columns_restriction()");
-        }
-    }
-
     return _restrictions->get_clustering_bounds(options);
 }
 
@@ -287,11 +296,11 @@ modification_statement::do_execute(service::storage_proxy& proxy, service::query
     tracing::add_table_name(qs.get_trace_state(), keyspace(), column_family());
 
     if (has_conditions()) {
+        ++_stats.cas_statements[size_t(type)];
         return execute_with_condition(proxy, qs, options);
     }
 
-    inc_cql_stats();
-
+    ++_stats.statements[size_t(type)];
     return execute_without_condition(proxy, qs, options).then([] {
         return make_ready_future<::shared_ptr<cql_transport::messages::result_message>>(
                 ::shared_ptr<cql_transport::messages::result_message>{});
@@ -313,19 +322,170 @@ modification_statement::execute_without_condition(service::storage_proxy& proxy,
             return now();
         }
 
-        return proxy.mutate_with_triggers(std::move(mutations), cl, timeout, false, qs.get_trace_state(), qs.get_permit(), this->is_raw_counter_shard_write());
+        auto mutate = [&, cl, timeout] (std::vector<mutation> mutations) {
+            return proxy.mutate_with_triggers(std::move(mutations), cl, timeout, false, qs.get_trace_state(), qs.get_permit(), this->is_raw_counter_shard_write());
+        };
+
+        if (qs.get_client_state().is_internal() || qs.get_client_state().is_thrift() || !s->cdc_options().enabled()) {
+            return mutate(std::move(mutations));
+        }
+        return cdc::append_log_mutations(
+                cdc::db_context::builder(proxy).build(),
+                s,
+                timeout,
+                qs,
+                std::move(mutations))
+        .then([cl, timeout, &proxy, &qs, mutate = std::move(mutate)] (std::vector<mutation> mutations) {
+            return mutate(std::move(mutations));
+        });
     });
 }
 
 future<::shared_ptr<cql_transport::messages::result_message>>
 modification_statement::execute_with_condition(service::storage_proxy& proxy, service::query_state& qs, const query_options& options) {
-    fail(unimplemented::cause::LWT);
+
+    auto cl_for_commit = options.get_consistency();
+    auto cl_for_paxos = options.check_serial_consistency();
+
+    db::validate_for_write(cl_for_commit);
+    db::validate_for_cas(cl_for_paxos);
+
+    db::timeout_clock::time_point now = db::timeout_clock::now();
+    const timeout_config& cfg = options.get_timeout_config();
+
+    auto statement_timeout = now + cfg.write_timeout; // All CAS networking operations run with write timeout.
+    auto cas_timeout = now + cfg.cas_timeout;         // When to give up due to contention.
+    auto read_timeout = now + cfg.read_timeout;       // When to give up on query.
+
+    json_cache_opt json_cache = maybe_prepare_json_cache(options);
+    std::vector<dht::partition_range> keys = build_partition_keys(options, json_cache);
+    std::vector<query::clustering_range> ranges = create_clustering_ranges(options, json_cache);
+
+    if (keys.empty()) {
+        throw exceptions::invalid_request_exception(format("Unrestricted partition key in a conditional {}",
+                    type.is_update() ? "update" : "deletion"));
+    }
+
+    auto request = seastar::make_shared<cas_request>(s, std::move(keys));
+    // cas_request can be used for batches as well single statements; Here we have just a single
+    // modification in the list of CAS commands, since we're handling single-statement execution.
+    request->add_row_update(*this, std::move(ranges), std::move(json_cache), options);
+
+    return proxy.cas(s, request, request->read_command(), request->key(),
+            {read_timeout, qs.get_permit(), qs.get_client_state(), qs.get_trace_state()},
+            cl_for_paxos, cl_for_commit, statement_timeout, cas_timeout).then([this, request] (bool is_applied) {
+        return build_cas_result_set(_metadata, _columns_of_cas_result_set, is_applied, request->rows());
+    });
+}
+
+seastar::shared_ptr<cql_transport::messages::result_message>
+modification_statement::build_cas_result_set(seastar::shared_ptr<cql3::metadata> metadata,
+        const column_mask& columns,
+        bool is_applied,
+        const update_parameters::prefetch_data& rows) {
+
+    auto result_set = std::make_unique<cql3::result_set>(metadata);
+    for (const auto& it : rows.rows) {
+        const update_parameters::prefetch_data::row& cell_map = it.second;
+        if (!cell_map.is_in_cas_result_set) {
+            continue;
+        }
+        std::vector<bytes_opt> row;
+        row.reserve(metadata->value_count());
+        row.emplace_back(boolean_type->decompose(is_applied));
+        for (ordinal_column_id id = columns.find_first(); id != column_mask::npos; id = columns.find_next(id)) {
+            const auto it = cell_map.cells.find(id);
+            if (it == cell_map.cells.end()) {
+                row.emplace_back(bytes_opt{});
+            } else {
+                const data_value& cell = it->second;
+                const abstract_type& cell_type = *cell.type();
+                const abstract_type& column_type = *rows.schema->column_at(id).type;
+
+                if (column_type.is_listlike() && cell_type.is_map()) {
+                    // List/sets are fetched as maps, but need to be stored as sets.
+                    const listlike_collection_type_impl& list_type = static_cast<const listlike_collection_type_impl&>(column_type);
+                    const map_type_impl& map_type = static_cast<const map_type_impl&>(cell_type);
+                    row.emplace_back(list_type.serialize_map(map_type, cell));
+                } else {
+                    row.emplace_back(cell_type.decompose(cell));
+                }
+            }
+        }
+        result_set->add_row(std::move(row));
+    }
+    if (result_set->empty()) {
+        // Is the case when, e.g., IF EXISTS or IF NOT EXISTS finds no row.
+        std::vector<bytes_opt> row;
+        row.emplace_back(boolean_type->decompose(is_applied));
+        row.resize(metadata->value_count());
+        result_set->add_row(std::move(row));
+    }
+    cql3::result result(std::move(result_set));
+    return seastar::make_shared<cql_transport::messages::result_message::rows>(std::move(result));
+}
+
+void modification_statement::build_cas_result_set_metadata() {
+
+    std::vector<shared_ptr<column_specification>> columns;
+    // Add the mandatory [applied] column to result set metadata
+    auto applied = seastar::make_shared<cql3::column_specification>(s->ks_name(), s->cf_name(),
+            make_shared<cql3::column_identifier>("[applied]", false), boolean_type);
+
+    columns.push_back(applied);
+
+    const auto& all_columns = s->all_columns();
+    if (_if_exists || _if_not_exists) {
+        // If all our conditions are columns conditions (IF x = ?), then it's enough to query
+        // the columns from the conditions. If we have a IF EXISTS or IF NOT EXISTS however,
+        // we need to query all columns for the row since if the condition fails, we want to
+        // return everything to the user.
+        // XXX Static columns make this a bit more complex, in that if an insert only static
+        // columns, then the existence condition applies only to the static columns themselves, and
+        // so we don't want to include regular columns in that case.
+        for (const auto& def : all_columns) {
+            _columns_of_cas_result_set.set(def.ordinal_id);
+        }
+    } else {
+        for (const auto& cond : _column_conditions) {
+            _columns_of_cas_result_set.set(cond->column.ordinal_id);
+        }
+        for (const auto& cond : _static_conditions) {
+            _columns_of_cas_result_set.set(cond->column.ordinal_id);
+        }
+    }
+    columns.reserve(columns.size() + all_columns.size());
+    // We must filter conditions using the _columns_of_cas_result_set, since
+    // the same column can be used twice in the condition list:
+    // if a > 0 and a < 3.
+    for (const auto& def : all_columns) {
+        if (_columns_of_cas_result_set.test(def.ordinal_id)) {
+            columns.emplace_back(def.column_specification);
+        }
+    }
+    // Ensure we prefetch all of the columns of the result set. This is also
+    // necessary to check conditions.
+    _columns_to_read.union_with(_columns_of_cas_result_set);
+    _metadata = seastar::make_shared<cql3::metadata>(std::move(columns));
 }
 
 void
 modification_statement::process_where_clause(database& db, std::vector<relation_ptr> where_clause, ::shared_ptr<variable_specifications> names) {
     _restrictions = ::make_shared<restrictions::statement_restrictions>(
             db, s, type, where_clause, std::move(names), applies_only_to_static_columns(), _sets_a_collection, false);
+    /*
+     * If there's no clustering columns restriction, we may assume that EXISTS
+     * check only selects static columns and hence we can use any row from the
+     * partition to check conditions.
+     */
+    if (_if_exists || _if_not_exists) {
+        assert(!_has_static_column_conditions && !_has_regular_column_conditions);
+        if (s->has_static_columns() && !_restrictions->has_clustering_columns_restriction()) {
+            _has_static_column_conditions = true;
+        } else {
+            _has_regular_column_conditions = true;
+        }
+    }
     if (_restrictions->get_partition_key_restrictions()->is_on_token()) {
         throw exceptions::invalid_request_exception(format("The token function cannot be used in WHERE clauses for UPDATE and DELETE statements: {}",
                 _restrictions->get_partition_key_restrictions()->to_string()));
@@ -371,6 +531,9 @@ modification_statement::process_where_clause(database& db, std::vector<relation_
         auto& col = s->column_at(column_kind::partition_key, _restrictions->get_partition_key_restrictions()->size());
         throw exceptions::invalid_request_exception(format("Missing mandatory PRIMARY KEY part {}", col.name_as_text()));
     }
+    if (has_conditions()) {
+        validate_where_clause_for_conditions();
+    }
 }
 
 namespace raw {
@@ -391,9 +554,15 @@ modification_statement::prepare(database& db, ::shared_ptr<variable_specificatio
     auto prepared_attributes = _attrs->prepare(db, keyspace(), column_family());
     prepared_attributes->collect_marker_specification(bound_names);
 
-    ::shared_ptr<cql3::statements::modification_statement> stmt = prepare_internal(db, schema, bound_names, std::move(prepared_attributes), stats);
+    return prepare_internal(db, schema, bound_names, std::move(prepared_attributes), stats);
+}
+
+void
+modification_statement::prepare_conditions(database& db, schema_ptr schema, ::shared_ptr<variable_specifications> bound_names,
+        cql3::statements::modification_statement& stmt)
+{
     if (_if_not_exists || _if_exists || !_conditions.empty()) {
-        if (stmt->is_counter()) {
+        if (stmt.is_counter()) {
             throw exceptions::invalid_request_exception("Conditional updates are not supported on counter tables");
         }
         if (_attrs->timestamp) {
@@ -405,11 +574,11 @@ modification_statement::prepare(database& db, ::shared_ptr<variable_specificatio
             // So far this is enforced by the parser, but let's assert it for sanity if ever the parse changes.
             assert(_conditions.empty());
             assert(!_if_exists);
-            stmt->set_if_not_exist_condition();
+            stmt.set_if_not_exist_condition();
         } else if (_if_exists) {
             assert(_conditions.empty());
             assert(!_if_not_exists);
-            stmt->set_if_exist_condition();
+            stmt.set_if_exist_condition();
         } else {
             for (auto&& entry : _conditions) {
                 auto id = entry.first->prepare_column_identifier(schema);
@@ -424,12 +593,11 @@ modification_statement::prepare(database& db, ::shared_ptr<variable_specificatio
                 if (def->is_primary_key()) {
                     throw exceptions::invalid_request_exception(format("PRIMARY KEY column '{}' cannot have IF conditions", *id));
                 }
-                stmt->add_condition(condition);
+                stmt.add_condition(condition);
             }
         }
-        stmt->validate_where_clause_for_conditions();
+        stmt.build_cas_result_set_metadata();
     }
-    return stmt;
 }
 
 }
@@ -471,6 +639,12 @@ void modification_statement::add_operation(::shared_ptr<operation> op) {
     if (op->requires_read()) {
         _requires_read = true;
         _columns_to_read.set(op->column.ordinal_id);
+        if (op->column.type->is_collection() ) {
+            auto ctype = static_pointer_cast<const collection_type_impl>(op->column.type);
+            if (!ctype->is_multi_cell()) {
+                throw std::logic_error(format("cannot prefetch frozen collection: {}", op->column.name_as_text()));
+            }
+        }
     }
 
     if (op->column.is_counter()) {
@@ -486,19 +660,21 @@ void modification_statement::add_operation(::shared_ptr<operation> op) {
 
 void modification_statement::add_condition(::shared_ptr<column_condition> cond) {
     if (cond->column.is_static()) {
-        _sets_static_columns = true;
+        _has_static_column_conditions = true;
         _static_conditions.emplace_back(std::move(cond));
     } else {
-        _sets_regular_columns = true;
+        _has_regular_column_conditions = true;
         _sets_a_collection |= cond->column.type->is_collection();
         _column_conditions.emplace_back(std::move(cond));
     }
-    _has_conditions = true;
 }
 
 void modification_statement::set_if_not_exist_condition() {
+    // We don't know yet if we need to select only static columns to check this
+    // condition or we need regular columns as well. So we postpone setting
+    // _has_regular_column_conditions/_has_static_column_conditions flag until
+    // we process WHERE clause, see process_where_clause().
     _if_not_exists = true;
-    _has_conditions = true;
 }
 
 bool modification_statement::has_if_not_exist_condition() const {
@@ -506,17 +682,48 @@ bool modification_statement::has_if_not_exist_condition() const {
 }
 
 void modification_statement::set_if_exist_condition() {
+    // See a comment in set_if_not_exist_condition().
     _if_exists = true;
-    _has_conditions = true;
 }
 
 bool modification_statement::has_if_exist_condition() const {
     return _if_exists;
 }
 
+void modification_statement::validate_where_clause_for_conditions() const {
+    // We don't support IN for CAS operation so far
+    if (_restrictions->key_is_in_relation()) {
+        throw exceptions::invalid_request_exception(
+                format("IN on the partition key is not supported with conditional {}",
+                    type.is_update() ? "updates" : "deletions"));
+    }
 
-void modification_statement::validate_where_clause_for_conditions() {
-    //  no-op by default
+    if (_restrictions->clustering_key_restrictions_has_IN()) {
+        throw exceptions::invalid_request_exception(
+                format("IN on the clustering key columns is not supported with conditional {}",
+                    type.is_update() ? "updates" : "deletions"));
+    }
+    if (type.is_delete() && (_restrictions->has_unrestricted_clustering_columns() ||
+                !_restrictions->clustering_key_restrictions_has_only_eq())) {
+
+        bool deletes_regular_columns = _column_operations.empty() ||
+            std::any_of(_column_operations.begin(), _column_operations.end(), [] (auto&& op) {
+                return !op->column.is_static();
+            });
+        // For example, primary key is (a, b, c), only a and b are restricted
+        if (deletes_regular_columns) {
+            throw exceptions::invalid_request_exception(
+                    "DELETE statements must restrict all PRIMARY KEY columns with equality relations"
+                    " in order to delete non static columns");
+        }
+
+        // All primary key parts must be specified, unless this statement has only static column conditions
+        if (_column_conditions.empty() == false) {
+            throw exceptions::invalid_request_exception(
+                    "DELETE statements must restrict all PRIMARY KEY columns with equality relations"
+                    " in order to use IF condition on non static columns");
+        }
+    }
 }
 
 modification_statement::json_cache_opt modification_statement::maybe_prepare_json_cache(const query_options& options) {
